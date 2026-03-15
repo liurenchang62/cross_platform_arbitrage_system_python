@@ -1,0 +1,136 @@
+# config/categories.toml
+# 类别映射配置文件
+
+[[categories]]
+name = "religion"
+weight = 1.0
+description = "宗教相关"
+keywords = [
+    "jesus", "christ", "god", "bible", "pope", "faith", "prayer", "church",
+    "catholic", "christian", "second coming", "rapture", "heaven", "hell", "salvation"
+]
+
+[[categories]]
+name = "gaming"
+weight = 1.0
+description = "游戏相关"
+keywords = [
+    "gta", "game", "playstation", "xbox", "nintendo", "fifa", "nba 2k",
+    "call of duty", "minecraft", "fortnite", "steam", "console", "gaming",
+    "esports", "video game"
+]
+
+[[categories]]
+name = "politics_us"
+weight = 1.0
+description = "美国政治"
+keywords = [
+    "president", "election", "senate", "congress", "vote", "nomination",
+    "republican", "democratic", "white house", "campaign", "poll", "governor",
+    "senator", "congressman", "biden", "trump", "harris", "pelosi", "mcconnell"
+]
+
+[[categories]]
+name = "politics_uk"
+weight = 1.0
+description = "英国政治"
+keywords = [
+    "prime minister", "parliament", "labour", "conservative", "brexit",
+    "westminster", "british", "uk", "london", "starmer", "sunak"
+]
+
+[[categories]]
+name = "crypto"
+weight = 1.0
+description = "加密货币"
+keywords = [
+    "bitcoin", "ethereum", "crypto", "blockchain", "nft", "web3", "btc", "eth",
+    "solana", "sol", "xrp", "dogecoin", "doge", "mining", "halving", "wallet",
+    "exchange", "binance", "coinbase"
+]
+
+[[categories]]
+name = "sports_basketball"
+weight = 1.0
+description = "篮球"
+keywords = [
+    "nba", "basketball", "finals", "mvp", "lebron", "curry", "durant",
+    "lakers", "warriors", "celtics", "bulls", "playoffs", "rookie", "all star"
+]
+
+[[categories]]
+name = "sports_football"
+weight = 1.0
+description = "美式足球"
+keywords = [
+    "nfl", "super bowl", "quarterback", "touchdown", "mahomes", "brady",
+    "chiefs", "patriots", "cowboys", "49ers", "pro bowl", "draft"
+]
+
+[[categories]]
+name = "weather"
+weight = 1.0
+description = "天气相关"
+keywords = [
+    "weather", "hurricane", "tornado", "storm", "flood", "drought",
+    "temperature", "record high", "record low", "snow", "rain", "climate",
+    "global warming", "el nino", "la nina"
+]
+
+[[categories]]
+name = "sports_soccer"
+weight = 1.0
+description = "足球"
+keywords = [
+    "soccer", "fifa", "world cup", "premier league", "champions league",
+    "european cup", "messi", "ronaldo", "mbappe", "real madrid", "barcelona",
+    "manchester", "liverpool", "arsenal", "chelsea", "bayern", "juventus", "psg"
+]
+
+[[categories]]
+name = "entertainment_movies"
+weight = 1.0
+description = "电影"
+keywords = [
+    "movie", "film", "oscar", "hollywood", "box office", "bond", "james bond",
+    "marvel", "dc", "avengers", "batman", "superman", "spiderman", "star wars"
+]
+
+[[categories]]
+name = "entertainment_music"
+weight = 1.0
+description = "音乐"
+keywords = [
+    "grammy", "album", "song", "concert", "tour", "taylor swift", "beyonce",
+    "drake", "ed sheeran", "spotify", "billboard", "platinum"
+]
+
+[[categories]]
+name = "technology"
+weight = 1.0
+description = "科技"
+keywords = [
+    "apple", "iphone", "google", "microsoft", "tesla", "spacex", "ai",
+    "artificial intelligence", "chatgpt", "openai", "robot", "software",
+    "hardware", "cybersecurity"
+]
+
+[[categories]]
+name = "business"
+weight = 1.0
+description = "商业"
+keywords = [
+    "ceo", "market", "stock", "investment", "merger", "acquisition", "ipo",
+    "billionaire", "fortune", "elon musk", "jeff bezos", "warren buffett",
+    "revenue", "profit", "earnings"
+]
+
+[[categories]]
+name = "science"
+weight = 1.0
+description = "科学"
+keywords = [
+    "nobel", "physics", "chemistry", "biology", "medicine", "research",
+    "discovery", "scientist", "space", "nasa", "mars", "moon", "planet",
+    "climate", "global warming"
+]
