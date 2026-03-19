@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.log
+logs/
+debug-*.log
+*.tmp
+*.swp
+.idea/
+.vscode/

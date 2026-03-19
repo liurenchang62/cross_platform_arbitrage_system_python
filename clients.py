@@ -334,6 +334,7 @@ class KalshiClient:
 
         def sync_request():
             try:
+                silent = bool(kwargs.pop("_silent", False))
                 timeout = kwargs.pop('timeout', 10)
                 if method.upper() == "GET":
                     response = requests.get(url, timeout=timeout, **kwargs)
@@ -343,19 +344,23 @@ class KalshiClient:
                     raise ValueError(f"Unsupported method: {method}")
 
                 if response.status_code != 200:
-                    print(f"请求失败: {response.status_code}")
-                    print(f"响应内容: {response.text[:200]}")
+                    if not silent:
+                        print(f"请求失败: {response.status_code}")
+                        print(f"响应内容: {response.text[:200]}")
                     response.raise_for_status()
 
                 return response.json()
             except requests.exceptions.Timeout:
-                print("请求超时")
+                if not silent:
+                    print("请求超时")
                 raise
             except requests.exceptions.ConnectionError as e:
-                print(f"连接错误: {e}")
+                if not silent:
+                    print(f"连接错误: {e}")
                 raise
             except Exception as e:
-                print(f"请求异常: {e}")
+                if not silent:
+                    print(f"请求异常: {e}")
                 raise
 
         return await loop.run_in_executor(None, sync_request)
@@ -503,7 +508,11 @@ class KalshiClient:
             "status": "open",
             "limit": "1000"
         }
-        return await self._request("GET", url, params=params)
+        try:
+            return await self._request("GET", url, params=params, _silent=True)
+        except Exception:
+            # 获取系列信息失败不应打断主流程，也不输出控制台错误噪音
+            return {"events": []}
 
     async def fetch_markets_page(self, cursor: str, limit: int) -> Tuple[List[dict], str]:
         """获取单页市场"""
