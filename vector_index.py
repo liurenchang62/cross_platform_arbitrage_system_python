@@ -1,11 +1,39 @@
 # vector_index.py
+#! 向量索引模块，使用 K-D Tree 实现近似最近邻搜索
+
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 from sklearn.neighbors import KDTree
-
+import datetime
+import json
+import time
 # K-D Tree 维度（向量维度）
 TREE_DIMENSION = 100
+
+
+def _agent_debug_log(hypothesisId: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    #region agent log
+    try:
+        with open("debug-951685.log", "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "951685",
+                        "runId": "pre-fix",
+                        "hypothesisId": hypothesisId,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    #endregion agent log
 
 
 @dataclass
@@ -28,84 +56,86 @@ class VectorIndex:
         self.built = False
 
     def build(self, items: List[IndexItem]) -> None:
-        """从向量列表构建索引"""
+        """从向量列表构建索引（优化版 - 真正批量构建）"""
         if not items:
             return
 
-        # 检查维度一致性
-        first_dim = len(items[0].vector)
-        if first_dim != self.dimension:
-            # 重新创建树以适应实际维度
-            self.dimension = first_dim
+        total = len(items)
+        print(f"        构建索引: {total} 个项")
+        _agent_debug_log(
+            "H1_datetime_import_or_shadow",
+            "vector_index.py:build:before_now",
+            "Inspect datetime binding before calling now()",
+            {
+                "datetime_repr": repr(datetime),
+                "datetime_type": str(type(datetime)),
+                "datetime_has_attr_now": bool(getattr(datetime, "now", None)),
+                "datetime_has_attr_datetime": bool(getattr(datetime, "datetime", None)),
+                "datetime_module_file": getattr(datetime, "__file__", None),
+                "globals_has_datetime": "datetime" in globals(),
+            },
+        )
+        start_time = datetime.datetime.now()
+        _agent_debug_log(
+            "H1_datetime_import_or_shadow",
+            "vector_index.py:build:after_now",
+            "Called datetime.now() successfully",
+            {"start_time_type": str(type(start_time)), "start_time_repr": repr(start_time)},
+        )
 
+        # 确定维度
+        self.dimension = len(items[0].vector)
+
+        # 清空现有数据
         self.items = items
         self.id_to_idx.clear()
 
-        # 构建向量矩阵
-        vectors = np.array([item.vector for item in items])
-
-        # 构建 K-D Tree
-        self.tree = KDTree(vectors)
-
-        # 构建 ID 到索引的映射
+        # 构建 ID 映射
         for idx, item in enumerate(self.items):
             self.id_to_idx[item.id] = idx
+            if idx % 5000 == 0 and idx > 0:
+                print(f"          构建ID映射: {idx}/{total}")
+
+        # 一次性构建 K-D Tree
+        print(f"          构建K-D Tree...")
+        vectors = np.array([item.vector for item in items])
+        self.tree = KDTree(vectors)
 
         self.built = True
+        elapsed = datetime.datetime.now() - start_time
+        print(f"        索引构建完成，耗时: {elapsed.total_seconds() * 1000:.0f}ms")
 
     def insert(self, item: IndexItem) -> None:
-        """插入单个向量到索引（注意：这会重建整个树）"""
-        # 由于 KDTree 不支持增量插入，需要重建
+        """插入单个向量到索引（现在只是添加到列表，不重建树）"""
+        # 简单添加到列表，不重建树
+        idx = len(self.items)
+        self.id_to_idx[item.id] = idx
         self.items.append(item)
-        self.build(self.items)
 
-    def find_similar(self, query_vector: np.ndarray, k: int) -> List[Tuple[IndexItem, float]]:
-        """查找最相似的 k 个向量"""
-        if not self.built or not self.items:
-            return []
-
-        # 检查维度
-        if len(query_vector) != self.dimension:
-            print(f"查询向量维度 {len(query_vector)} 不匹配索引维度 {self.dimension}")
-            return []
-
-        # 查询 K-D Tree
-        query = query_vector.reshape(1, -1)
-        distances, indices = self.tree.query(query, k=min(k, len(self.items)))
-
-        results = []
-        for i, idx in enumerate(indices[0]):
-            item = self.items[idx]
-            # 将欧氏距离转换为余弦相似度
-            # 对于归一化向量，余弦相似度 = 1 - (dist² / 2)
-            similarity = 1.0 - (distances[0][i] ** 2 / 2.0)
-            similarity = max(0.0, min(1.0, similarity))  # 限制在 [0,1] 范围
-            results.append((item, similarity))
-
-        return results
+        # 标记为未构建，下次查询前需要重建
+        self.built = False
 
     def find_similar_with_threshold(
-            self,
-            query_vector: np.ndarray,
-            threshold: float,
-            max_results: int
+        self,
+        query_vector: np.ndarray,
+        threshold: float,
+        max_results: int,
     ) -> List[Tuple[IndexItem, float]]:
         """查找超过相似度阈值的所有向量"""
         if not self.built or not self.items:
             return []
 
-        # 检查维度
         if len(query_vector) != self.dimension:
             return []
 
         # 对于归一化向量，余弦相似度阈值转换为欧氏距离阈值
         # similarity >= threshold => 1 - (dist²/2) >= threshold => dist² <= 2*(1-threshold)
-        dist_threshold = np.sqrt(2.0 * (1.0 - threshold))
+        dist_sq_threshold = 2.0 * (1.0 - threshold)
 
         query = query_vector.reshape(1, -1)
 
         # 使用 radius 查询查找半径内的所有点
-        indices = self.tree.query_radius(query, r=dist_threshold)[0]
+        indices = self.tree.query_radius(query, r=np.sqrt(dist_sq_threshold))[0]
 
         if len(indices) == 0:
             return []
@@ -131,17 +161,6 @@ class VectorIndex:
 
         return results
 
-    def get_by_id(self, id: str) -> Optional[IndexItem]:
-        """通过 ID 获取向量项"""
-        idx = self.id_to_idx.get(id)
-        if idx is not None:
-            return self.items[idx]
-        return None
-
-    def items_list(self) -> List[IndexItem]:
-        """获取所有项"""
-        return self.items.copy()
-
     def len(self) -> int:
         """获取索引大小"""
         return len(self.items)
@@ -158,22 +177,9 @@ class VectorIndex:
         """获取向量维度"""
         return self.dimension
 
-    def clear(self):
-        """清理索引（重建）"""
+    def clear(self) -> None:
+        """清理索引"""
         self.tree = None
         self.id_to_idx.clear()
         self.items.clear()
         self.built = False
-
-
-def batch_find_similar(
-        index: VectorIndex,
-        query_vectors: List[np.ndarray],
-        threshold: float,
-        max_results_per_query: int
-) -> List[List[Tuple[IndexItem, float]]]:
-    """简化的批处理查找函数"""
-    results = []
-    for vec in query_vectors:
-        results.append(index.find_similar_with_threshold(vec, threshold, max_results_per_query))
-    return results

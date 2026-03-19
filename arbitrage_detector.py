@@ -1,7 +1,10 @@
 # arbitrage_detector.py
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
-from event import MarketPrices
+from market import MarketPrices
+
+# Gas 费配置（固定值，单位 USDT）
+GAS_FEE = 0.02  # 每笔交易 $0.02
 
 
 @dataclass
@@ -15,6 +18,9 @@ class ArbitrageOpportunity:
     fees: float
     net_profit: float
     roi_percent: float
+    gas_fee: float
+    final_profit: float
+    final_roi_percent: float
 
 
 @dataclass
@@ -47,10 +53,121 @@ class ArbitrageDetector:
         self.fees.kalshi = kalshi_fee
         return self
 
+    def calculate_arbitrage_with_direction(
+        self,
+        pm_prices: MarketPrices,
+        kalshi_prices: MarketPrices,
+        pm_side: str,
+        kalshi_side: str,
+        needs_inversion: bool,
+    ) -> Optional[ArbitrageOpportunity]:
+        """根据方向计算套利机会"""
+        # 根据方向确定实际买卖
+        if pm_side == "YES":
+            pm_action = "BUY"
+            pm_price = pm_prices.yes_ask if pm_prices.yes_ask is not None else pm_prices.yes
+        else:
+            pm_action = "BUY"
+            pm_price = pm_prices.no_ask if pm_prices.no_ask is not None else pm_prices.no
+
+        if kalshi_side == "YES":
+            kalshi_action = "BUY"
+            kalshi_price = kalshi_prices.yes_ask if kalshi_prices.yes_ask is not None else kalshi_prices.yes
+        else:
+            kalshi_action = "BUY"
+            kalshi_price = kalshi_prices.no_ask if kalshi_prices.no_ask is not None else kalshi_prices.no
+
+        # 计算成本
+        total_cost = pm_price + kalshi_price
+        profit = 1.0 - total_cost
+        total_fees = self.fees.polymarket + self.fees.kalshi
+
+        if profit <= total_fees + self.min_profit_threshold:
+            return None
+
+        net_profit = profit - total_fees
+        final_profit = net_profit - GAS_FEE
+
+        if final_profit <= self.min_profit_threshold:
+            return None
+
+        roi = (final_profit / total_cost) * 100.0 if total_cost > 0 else 0.0
+
+        # 构建策略描述
+        inversion_note = " [Y/N颠倒]" if needs_inversion else ""
+        strategy = f"Buy {pm_side} on Polymarket + Buy {kalshi_side} on Kalshi{inversion_note}"
+
+        return ArbitrageOpportunity(
+            strategy=strategy,
+            kalshi_action=(kalshi_action, kalshi_side, kalshi_price),
+            polymarket_action=(pm_action, pm_side, pm_price),
+            total_cost=total_cost,
+            gross_profit=profit,
+            fees=total_fees,
+            net_profit=net_profit,
+            roi_percent=roi,
+            gas_fee=GAS_FEE,
+            final_profit=final_profit,
+            final_roi_percent=roi,
+        )
+
+    def calculate_final_profit(
+        self,
+        pm_prices: MarketPrices,
+        kalshi_prices: MarketPrices,
+        pm_slippage: float,
+        kalshi_slippage: float,
+    ) -> Optional[ArbitrageOpportunity]:
+        """考虑滑点后的最终利润计算"""
+        opportunity = self.check_arbitrage_optimal(pm_prices, kalshi_prices)
+        if opportunity is None:
+            return None
+
+        # 根据策略确定方向并应用滑点
+        if "Buy Yes on Polymarket" in opportunity.strategy:
+            pm_slipped = pm_prices.yes * (1.0 + pm_slippage / 100.0)
+        else:
+            pm_slipped = pm_prices.no * (1.0 + pm_slippage / 100.0)
+
+        if "Buy Yes on Kalshi" in opportunity.strategy:
+            kalshi_slipped = kalshi_prices.yes * (1.0 + kalshi_slippage / 100.0)
+        else:
+            kalshi_slipped = kalshi_prices.no * (1.0 + kalshi_slippage / 100.0)
+
+        slipped_cost = pm_slipped + kalshi_slipped
+        slipped_profit = 1.0 - slipped_cost
+
+        if slipped_profit <= 0.0:
+            return None
+
+        total_fees = self.fees.polymarket + self.fees.kalshi
+        net_profit = slipped_profit - total_fees
+        final_profit = net_profit - GAS_FEE
+
+        if final_profit <= self.min_profit_threshold:
+            return None
+
+        roi = (final_profit / slipped_cost) * 100.0 if slipped_cost > 0 else 0.0
+
+        # 复用原有的 action 信息
+        return ArbitrageOpportunity(
+            strategy=opportunity.strategy,
+            kalshi_action=opportunity.kalshi_action,
+            polymarket_action=opportunity.polymarket_action,
+            total_cost=slipped_cost,
+            gross_profit=slipped_profit,
+            fees=total_fees,
+            net_profit=net_profit,
+            roi_percent=(net_profit / slipped_cost) * 100.0,
+            gas_fee=GAS_FEE,
+            final_profit=final_profit,
+            final_roi_percent=roi,
+        )
+
     def check_arbitrage_optimal(
-            self,
-            pm_prices: MarketPrices,
-            kalshi_prices: MarketPrices,
+        self,
+        pm_prices: MarketPrices,
+        kalshi_prices: MarketPrices,
     ) -> Optional[ArbitrageOpportunity]:
         """只用最优价检查潜在机会（快速筛选）"""
         # 验证价格有效性
@@ -93,7 +210,10 @@ class ArbitrageDetector:
                 gross_profit=profit_strategy_1,
                 fees=total_fees,
                 net_profit=net_profit,
-                roi_percent=roi
+                roi_percent=roi,
+                gas_fee=0.0,
+                final_profit=0.0,
+                final_roi_percent=0.0,
             )
 
         # 检查策略2
@@ -109,7 +229,10 @@ class ArbitrageDetector:
                 gross_profit=profit_strategy_2,
                 fees=total_fees,
                 net_profit=net_profit,
-                roi_percent=roi
+                roi_percent=roi,
+                gas_fee=0.0,
+                final_profit=0.0,
+                final_roi_percent=0.0,
             )
 
         return None
@@ -119,8 +242,8 @@ class ArbitrageDetector:
 
 
 def calculate_slippage_with_fixed_usdt(
-        asks: List[Tuple[float, float]],
-        usdt_amount: float
+    asks: List[Tuple[float, float]],
+    usdt_amount: float
 ) -> SlippageInfo:
     """
     根据固定USDT金额计算滑点

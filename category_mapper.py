@@ -1,4 +1,8 @@
 # category_mapper.py
+#! 类别映射模块：负责将事件标题映射到预定义的类别
+#
+# 从 categories.toml 加载配置，提供多类别判断功能
+
 import toml
 import os
 from datetime import datetime
@@ -149,7 +153,7 @@ class CategoryMapper:
         return keywords[:10]  # 最多保留10个关键词
 
 
-# 全局单例类别映射器
+# 全局单例类别映射器（可选，用于需要全局访问的场景）
 _GLOBAL_CATEGORY_MAPPER: Optional[CategoryMapper] = None
 
 
