@@ -4,34 +4,87 @@
 
 ## Overview
 
-This **Python** port mirrors the behavior of the Rust `arbitrage-monitor` in `cross_market_arbitrage_project`: it discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, maintains a watchlist of high-confidence pairs, and evaluates economics from **live order-book data**. It performs **read-only analysis** and does not submit orders.
+This repository contains a **Python** application that discovers cross-venue relationships between **Polymarket** and **Kalshi** prediction markets, maintains a watchlist of high-confidence candidate pairs, and evaluates **executable economics** from **live order-book data**. The program performs **read-only analysis**: it fetches public market listings and order books, runs matching and profitability models, and writes structured logs. It **does not** submit orders or trade on your behalf.
 
-The pipeline combines text-based market matching (vector similarity and category rules), scheduled full refreshes and incremental tracking cycles, and structured logging under `logs/`.
+The end-to-end pipeline includes:
+
+- Pulling open markets from both platforms with configurable pagination and safety limits.
+- **Text-based matching** using TF-IDF–style vectors, cosine similarity, and category-aware rules driven by `config/categories.toml`.
+- A **second-pass validation** stage (`validation.py`) that filters implausible pairings (cross-sport or structurally incompatible market types) before order-book analysis.
+- Optional **resolution-horizon filtering** so that only markets expected to resolve within a configured calendar window are considered (`market_filter.py`, parameters in `query_params.py`).
+- **Tracking** of pairs across monitor cycles, with periodic full rebuilds of the candidate set and incremental updates for pairs already under watch (`tracking.py`).
+- **Structured logging**: daily monitor CSV files under `logs/`, plus optional capture of hard-to-classify markets under `logs/unclassified/`.
+
+Together, these pieces support continuous monitoring for situations where the same underlying proposition may be priced differently across venues, subject to the limitations described under **Disclaimer**.
 
 ## Features
 
-- **Market data**: Loads open markets from the Polymarket Gamma API and the Kalshi Trade API, with configurable pagination and upper bounds.
-- **Matching**: TF-IDF-style text vectors and cosine similarity; optional category constraints and scoring from `config/categories.toml`.
-- **Execution-style PnL**: For each candidate pair, costs and net profit for a **notional-capped, depth-walked** buy scenario are derived from **parsed ask ladders** on both venues (see **Order-book PnL model**).
-- **Tracking**: Maintains tracked pairs across cycles, with periodic full rebuilds and parameter-driven intervals (`query_params.py`).
-- **Logging**: Append-only monitor CSVs under `logs/monitor_YYYY-MM-DD.csv` (local calendar day); unmatched items may be recorded under `logs/unclassified/`.
+### Market data
+
+- Loads **open** markets from the **Polymarket Gamma API** and the **Kalshi Trade API**.
+- Pagination, per-request limits, and global caps are centralized in `query_params.py` so you can tune how aggressively the monitor scans without changing core logic.
+- Market records are normalized into internal structures (`market.py`) for consistent handling in matching and logging.
+
+### Matching and classification
+
+- **Vectorization**: English-oriented tokenization and stemming (via `snowballstemmer` in `text_vectorizer.py`) produce sparse vectors comparable in spirit to classic TF-IDF weighting.
+- **Indexing and search**: `vector_index.py` supports efficient similarity queries; `market_matcher.py` orchestrates building indices per venue, cross-querying, and applying **top‑K** and **similarity threshold** cuts from `query_params.py`.
+- **Categories**: `config/categories.toml` supplies category labels, keyword hints, and weights. `category_mapper.py` and `category_vectorizer.py` integrate category signals with text similarity so that matches are both numerically close and semantically plausible.
+
+### Second-pass validation
+
+- After vector similarity proposes a candidate pair, `validation.py` runs a **fixed-order pipeline** of rule-based checks (sports vs politics, totals vs outrights, esports map winners vs series winners, handicap vs moneyline, and many other cross-type guards).
+- Pairs that fail validation are **discarded** before any order-book or PnL work runs, reducing noise from embeddings alone.
+
+### Resolution horizon
+
+- `market_filter.py` can restrict the universe to markets whose **expected resolution** falls within a configured number of days ahead (`RESOLUTION_HORIZON_DAYS` and related settings in `query_params.py`), so monitoring focuses on nearer-dated events when desired.
+
+### Execution-style profit and loss (order-book scenario)
+
+- For each **validated** pair that passes similarity and business rules, the program requests **current** order books on both venues and parses **ask-side liquidity** into ascending price ladders.
+- It then computes a **notional-capped, depth-walked** buy scenario on each leg, derives a **common hedged size**, and reports **capital used**, **fees**, **assumed gas**, and **`net_profit_100`** (see **Order-book PnL model** below).
+- Implementation lives in `arbitrage_detector.py` and is invoked from `main.py` (`validate_arbitrage_pair` and related helpers).
+
+### Tracking across cycles
+
+- `tracking.py` records which pairs are under active watch, their last-seen similarity and profitability, and supports **full refresh** intervals versus lighter incremental passes, as configured in `query_params.py`.
+- This allows the monitor to keep continuity across runs without re-deriving the entire opportunity set every cycle.
+
+### Logging and auxiliary tools
+
+- **`monitor_logger.py`**: append-only **daily** CSV logs (`logs/monitor_YYYY-MM-DD.csv` in local calendar terms) capturing arbitrage-relevant rows for later analysis.
+- **`cycle_statistics.py`**: aggregates cycle-level statistics (for example cumulative or full-pass return-on-capital style summaries printed during long runs).
+- **`unclassified_logger.py`**: optional logging when markets do not map cleanly to configured categories.
+- **`check_unclassified.py`**: helper script to inspect or summarize unclassified logs.
 
 ## Order-book PnL model
 
-Same definition as the Rust project:
+The scenario used for ranking and reporting (for example cycle **Top 10** and **`net_profit_100`**) is defined as follows:
 
-1. **Order-book snapshots** — ascending ask ladders `(price, size)`.
-2. **Per-leg notional cap** — **100 USDT** per leg (`trade_amount` in `main.py`).
-3. **Hedged size** — **n** = minimum of the two per-leg fillable contract counts.
-4. **Cost and profit at n** — `cost_for_exact_contracts`, fees, gas → **`net_profit_100`**.
+1. **Order-book snapshots**  
+   For each matched pair that survives validation, the program requests the **current** Polymarket and Kalshi **order books** over HTTP and parses resting **sell-side** liquidity into **ascending ask ladders** `(price, size)`.
+
+2. **Per-leg notional cap**  
+   Each leg is allocated a maximum spend of **100 USDT** (`trade_amount` in `main.py`). The ladder is traversed **level by level** until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `arbitrage_detector.py`), yielding a **fillable contract count** per venue for that cap.
+
+3. **Hedged size**  
+   The scenario size **n** is the **minimum** of the two per-leg contract counts so that both legs can be notionally filled at the **same** number of contracts.
+
+4. **Cost and profit at size n**  
+   For exactly **n** contracts, per-leg total cost and **volume-weighted average prices** are recomputed by walking each ladder again (`cost_for_exact_contracts`). Combined legs yield **`capital_used`**. Platform fees and a **fixed gas assumption** are subtracted to obtain **`net_profit_100`**. A row is treated as an actionable opportunity when **`net_profit_100`** exceeds the detector’s configured minimum; this gate is applied to the **depth-based** result, not to a single price level in isolation.
 
 **Implementation reference**: `validate_arbitrage_pair` in `main.py`; `calculate_arbitrage_100usdt`, `calculate_slippage_with_fixed_usdt`, and `cost_for_exact_contracts` in `arbitrage_detector.py`.
 
 ## Requirements
 
-- **Python** 3.10+ recommended
-- Dependencies: see `requirements.txt` (includes `snowballstemmer` for English stemming, matching Rust `rust_stemmers`)
-- Network access to Polymarket and Kalshi public APIs
+- **Python** 3.10 or newer recommended.
+- Install dependencies from `requirements.txt`:
+  - **`aiohttp`** — asynchronous HTTP client for API calls.
+  - **`numpy`** — numerical routines used in vector operations.
+  - **`snowballstemmer`** — English stemming for text tokenization.
+  - **`toml`** — parsing `config/categories.toml`.
+- Reliable **network access** to Polymarket and Kalshi public APIs. Endpoint URLs and rate limits may change; verify against current platform documentation if something stops working.
 
 ## Quick start
 
@@ -40,48 +93,54 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Ensure **`config/categories.toml`** exists before the first run.
+Ensure **`config/categories.toml`** exists before the first run (a starter file is expected to live under `config/` in this repository).
 
 ## Configuration
 
 | Path | Purpose |
 |------|---------|
-| `config/categories.toml` | Category names, weights, and keywords |
-| `query_params.py` | Request pacing, limits, `SIMILARITY_THRESHOLD`, `SIMILARITY_TOP_K`, `FULL_FETCH_INTERVAL`, `RESOLUTION_HORIZON_DAYS`, etc. |
+| `config/categories.toml` | Category names, weights, and keyword lists used for classification-aware matching. |
+| `query_params.py` | Request pacing, page sizes, fetch caps, **`SIMILARITY_THRESHOLD`**, **`SIMILARITY_TOP_K`**, **`FULL_FETCH_INTERVAL`**, **`RESOLUTION_HORIZON_DAYS`**, and other global tuning constants. |
 
 ### Optional environment variables
 
-- **`POLYMARKET_TAG_SLUG`**: When set, Polymarket fetches may be restricted by tag (see `clients.py`).
+- **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted to a specific tag slug (see `clients.py`).
 
 ## Repository layout
 
 ```
 main.py                 Entry point and monitor loop
 clients.py              HTTP clients for Polymarket and Kalshi
-market_matcher.py       Matching and index construction
-text_vectorizer.py      Text vectorization
-vector_index.py         Vector search
-arbitrage_detector.py   Order-book traversal, fees, and PnL helpers
-query_params.py         Shared tuning constants
-validation.py           Validation helpers
-tracking.py             Per-cycle monitor state
-market_filter.py        Resolution-horizon filtering (21d window)
-monitor_logger.py       Daily CSV monitor log
-cycle_statistics.py     Cumulative / full-cycle ROI stats
+market.py               Normalized market record types
+market_matcher.py       Matching, similarity search, and index construction
+text_vectorizer.py      Tokenization, stemming, and vectorization
+category_vectorizer.py  Category-aware vector helpers
+category_mapper.py      Category assignment from configuration
+vector_index.py         Vector index and nearest-neighbor search
+validation.py           Second-pass rule pipeline for candidate pairs
+market_filter.py        Resolution-horizon and related listing filters
+arbitrage_detector.py   Order-book traversal, fees, gas, and PnL helpers
+query_params.py         Shared tuning constants and API pacing
+tracking.py             Per-cycle watch state for tracked pairs
+monitor_logger.py       Daily CSV monitor log writer
+cycle_statistics.py     Cycle-level statistical summaries
+unclassified_logger.py  Logging for unclassified markets
+check_unclassified.py   Utility to inspect unclassified logs
 config/
   categories.toml
 docs/
   MATCHING_VERIFICATION.md
+requirements.txt
 ```
 
-Further detail: **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**.
+Further detail on matching behavior and verification notes: **[docs/MATCHING_VERIFICATION.md](docs/MATCHING_VERIFICATION.md)**.
 
 ## Disclaimer
 
-- Provided for **research and educational use** only; not investment advice.
-- Reported PnL is a **model output** from snapshots and assumptions; **live results may differ**.
-- Comply with each platform’s terms of service and applicable law.
+- Provided for **research and educational use** only; nothing herein is **investment**, **trading**, or **legal** advice.
+- Prediction markets differ in **rules**, **settlement**, **liquidity**, **fees**, and **latency**. Reported PnL is a **model output** derived from **point-in-time** order-book snapshots and simplifying assumptions (including fees and gas); **live results may differ materially**.
+- You are responsible for complying with each platform’s **terms of service**, **API policies**, and **applicable laws and regulations** in your jurisdiction.
 
 ## License
 
-If no `LICENSE` file is present, all rights are reserved; add one if you intend to distribute under open terms.
+If no `LICENSE` file is present in this repository, all rights are reserved. Add a license file if you intend to distribute this project under open terms.
