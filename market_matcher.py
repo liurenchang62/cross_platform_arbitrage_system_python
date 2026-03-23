@@ -1,20 +1,30 @@
 # market_matcher.py
-#! 市场匹配器：TF-IDF 文本向量 + 类内精确余弦（堆叠矩阵点积）检索，与 Rust 一致
+#! 市场匹配器：TF-IDF（L2 归一化）+ 按类精确余弦 Top-K 候选生成，再经二筛（与 Rust `market_matcher.rs` 对齐）
 
-import numpy as np
-from typing import List, Dict, Optional, Tuple, Set, Any
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 import asyncio
-import json
+import copy
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from market import Market
 from category_mapper import CategoryMapper
+from category_vectorizer import CategoryVectorizer, CategoryVectorizerManager
+from text_vectorizer import TextVectorizer, VectorizerConfig
 from unclassified_logger import UnclassifiedLogger
 from query_params import SIMILARITY_THRESHOLD, SIMILARITY_TOP_K
-from category_vectorizer import CategoryVectorizerManager
-from text_vectorizer import VectorizerConfig
 from validation import ValidationPipeline, MatchInfo
+
+
+def _parallel_build_category_worker(
+    task: Tuple[str, List[Tuple[str, str, Optional[Any]]], TextVectorizer],
+) -> Tuple[str, CategoryVectorizer]:
+    """供 `parallel_build_category_indices` 线程池使用（与 Rust rayon 任务等价）。"""
+    category, items, vz = task
+    cv = CategoryVectorizer.with_fitted_vectorizer(category, vz)
+    cv.add_markets_batch(items)
+    return category, cv
 
 
 @dataclass
@@ -55,7 +65,8 @@ class MarketMatcher:
         self.kalshi_vectorizers = CategoryVectorizerManager()
         self.polymarket_vectorizers = CategoryVectorizerManager()
         self.fitted = False
-        self.market_cache: Dict[str, Market] = {}
+        self.kalshi_market_cache: Dict[str, Market] = {}
+        self.polymarket_market_cache: Dict[str, Market] = {}
         self.validation_pipeline = ValidationPipeline()
 
     def with_logger(self, logger: UnclassifiedLogger) -> 'MarketMatcher':
@@ -90,6 +101,31 @@ class MarketMatcher:
         self.polymarket_vectorizers.fit_all(polymarket_by_category)
 
         self.fitted = True
+
+    @staticmethod
+    def parallel_build_category_indices(
+        manager: CategoryVectorizerManager,
+        by_category: Dict[str, List[Tuple[str, str, Optional[Any]]]],
+    ) -> None:
+        """按类别并行建索引：与串行逐类 `add_markets_batch` 数学上等价。"""
+        n_cat = len(by_category)
+        if n_cat == 0:
+            return
+        print(f"      并行构建 {n_cat} 个类别索引 (rayon)...")
+        tasks: List[Tuple[str, List[Tuple[str, str, Optional[Any]]], TextVectorizer]] = []
+        for category in sorted(by_category.keys()):
+            items = by_category[category]
+            cv = manager.get(category)
+            if cv is None or not cv.fitted:
+                continue
+            tasks.append((category, items, copy.deepcopy(cv.vectorizer)))
+        if not tasks:
+            return
+        max_workers = min(32, len(tasks))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            built = list(ex.map(_parallel_build_category_worker, tasks))
+        for cat, cv in built:
+            manager.insert_built_category(cat, cv)
 
     def build_kalshi_index(self, markets: List[Market]) -> None:
         """构建 Kalshi 市场索引"""
@@ -126,12 +162,8 @@ class MarketMatcher:
                         by_category[cat] = []
                     by_category[cat].append((market_id, market.title, data))
 
-        self.market_cache.update(cache)
-
-        for category, items in by_category.items():
-            vectorizer = self.kalshi_vectorizers.get_or_create(category)
-            if vectorizer:
-                vectorizer.add_markets_batch(items)
+        self.kalshi_market_cache = cache
+        self.parallel_build_category_indices(self.kalshi_vectorizers, by_category)
 
         print(f"   ✅ Kalshi 索引构建完成，总市场数: {self.kalshi_vectorizers.total_size()}")
 
@@ -170,12 +202,8 @@ class MarketMatcher:
                         by_category[cat] = []
                     by_category[cat].append((market_id, market.title, data))
 
-        self.market_cache.update(cache)
-
-        for category, items in by_category.items():
-            vectorizer = self.polymarket_vectorizers.get_or_create(category)
-            if vectorizer:
-                vectorizer.add_markets_batch(items)
+        self.polymarket_market_cache = cache
+        self.parallel_build_category_indices(self.polymarket_vectorizers, by_category)
 
         print(f"   ✅ Polymarket 索引构建完成，总市场数: {self.polymarket_vectorizers.total_size()}")
 
@@ -194,49 +222,34 @@ class MarketMatcher:
         print("\n🔍 ====== 开始双向匹配 ======")
 
         # 克隆需要的数据用于并行任务
-        kalshi_vec = self.kalshi_vectorizers
-        polymarket_vec = self.polymarket_vectorizers
-
-        category_mapper1 = self.category_mapper
-        category_mapper2 = self.category_mapper
-
-        config1 = self.config
-        config2 = self.config
-
-        market_cache1 = self.market_cache
-        market_cache2 = self.market_cache
-
         pm_markets_list = pm_markets.copy()
         kalshi_markets_list = kalshi_markets.copy()
 
         start_time = datetime.now()
 
-        print("\n📌 并行执行两个方向...")
+        print("\n📌 并行执行两个方向（spawn_blocking 确保 CPU 密集任务真并行）...")
 
-        # 真正的并行执行
-        task1 = asyncio.create_task(
-            self._find_matches_directional_internal(
+        # 与 Rust `tokio::task::spawn_blocking` 等价：在线程池跑 CPU 密集匹配，避免阻塞事件循环
+        results = await asyncio.gather(
+            asyncio.to_thread(
+                self._find_matches_directional_sync,
                 pm_markets_list,
-                kalshi_vec,
-                category_mapper1,
-                config1,
-                market_cache1,
+                self.kalshi_vectorizers,
+                self.category_mapper,
+                self.config,
+                self.kalshi_market_cache,
                 "PM→Kalshi",
-            )
-        )
-
-        task2 = asyncio.create_task(
-            self._find_matches_directional_internal(
+            ),
+            asyncio.to_thread(
+                self._find_matches_directional_sync,
                 kalshi_markets_list,
-                polymarket_vec,
-                category_mapper2,
-                config2,
-                market_cache2,
+                self.polymarket_vectorizers,
+                self.category_mapper,
+                self.config,
+                self.polymarket_market_cache,
                 "Kalshi→PM",
-            )
+            ),
         )
-
-        results = await asyncio.gather(task1, task2)
         matches1, pipeline1 = results[0]
         matches2, pipeline2 = results[1]
 
@@ -283,7 +296,7 @@ class MarketMatcher:
 
         elapsed = datetime.now() - start_time
         print(f"\n📊 ====== 匹配统计 ======")
-        print(f"   并行匹配耗时: {elapsed.total_seconds() * 1000:.0f}ms")
+        print(f"   并行匹配耗时: {elapsed.total_seconds():.3f}s")
         print(f"   初筛匹配对: {initial_count} 个")
         print(f"   二筛过滤: {filtered_count} 个")
         print(f"   二筛后待跟踪: {final_count} 个")
@@ -292,16 +305,16 @@ class MarketMatcher:
 
         return all_matches
 
-    async def _find_matches_directional_internal(
+    def _find_matches_directional_sync(
         self,
         query_markets: List[Market],
         target_vectorizers: CategoryVectorizerManager,
         category_mapper: CategoryMapper,
         config: MarketMatcherConfig,
-        market_cache: Dict[str, Market],
+        target_market_cache: Dict[str, Market],
         direction_label: str,
     ) -> Tuple[List[Tuple[Market, Market, float, str, str, bool]], ValidationPipeline]:
-        """单向查找匹配的市场对"""
+        """同步版本：供线程池使用（与 Rust `find_matches_directional_sync` 对齐）。"""
         all_matches = []
         total = len(query_markets)
         pipeline = ValidationPipeline()
@@ -338,7 +351,7 @@ class MarketMatcher:
                         continue
                     seen_qt.add((query_full_id, item.id))
 
-                    target_market = market_cache.get(item.id)
+                    target_market = target_market_cache.get(item.id)
                     if not target_market:
                         continue
 

@@ -1,9 +1,11 @@
 # category_vectorizer.py
-#! 类别独立的向量化器管理
+#! 类别独立的向量化器管理（与 Rust `category_vectorizer.rs` 对齐：并行 fit_all / with_fitted_vectorizer / insert_built_category）
 
-import numpy as np
+from __future__ import annotations
+
+import copy
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple, Any
-from dataclasses import dataclass, field
 
 from text_vectorizer import TextVectorizer, VectorizerConfig
 from vector_index import VectorIndex, IndexItem
@@ -17,6 +19,14 @@ class CategoryVectorizer:
         self.vectorizer = TextVectorizer(VectorizerConfig())
         self.index = VectorIndex(category)
         self.fitted = False
+
+    @classmethod
+    def with_fitted_vectorizer(cls, category: str, vectorizer: TextVectorizer) -> "CategoryVectorizer":
+        """从已训练好的 `TextVectorizer` 构造（用于并行建索引，与 `fit` 后状态一致）。"""
+        cv = cls(category)
+        cv.vectorizer = copy.deepcopy(vectorizer)
+        cv.fitted = True
+        return cv
 
     def fit(self, titles: List[str]) -> None:
         """拟合向量化器"""
@@ -68,6 +78,14 @@ class CategoryVectorizer:
         return []
 
 
+def _fit_one_category(args: Tuple[str, List[str]]) -> Tuple[str, CategoryVectorizer]:
+    """供 `fit_all` 线程池调用（每线程独立 CategoryVectorizer）。"""
+    category, titles = args
+    cv = CategoryVectorizer(category)
+    cv.fit(titles)
+    return category, cv
+
+
 class CategoryVectorizerManager:
     """类别向量化器管理器"""
 
@@ -90,20 +108,25 @@ class CategoryVectorizerManager:
             return self.unclassified_vectorizer
         return self.vectorizers.get(category)
 
+    def insert_built_category(self, category: str, cv: CategoryVectorizer) -> None:
+        """将并行构建好的类别向量化器写回（仅替换对应键）。"""
+        if category == "unclassified":
+            self.unclassified_vectorizer = cv
+        else:
+            self.vectorizers[category] = cv
+
     def fit_all(self, markets_by_category: Dict[str, List[str]]) -> None:
-        """拟合所有类别"""
+        """并行拟合所有类别（与 Rust `rayon` 语义对齐）。"""
         total = len(markets_by_category)
-        processed = 0
-
-        for category, titles in markets_by_category.items():
-            processed += 1
-            # 每5个类别输出一次进度
-            if processed % 5 == 0 or processed == 1:
-                print(f"      拟合进度: {processed}/{total} 个类别")
-
-            vectorizer = self.get_or_create(category)
-            if vectorizer:
-                vectorizer.fit(titles)
+        if total == 0:
+            return
+        print(f"      并行拟合 {total} 个类别 (rayon)...")
+        pairs = sorted(markets_by_category.items(), key=lambda x: x[0])
+        max_workers = min(32, total)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fitted = list(ex.map(_fit_one_category, pairs))
+        for category, cv in fitted:
+            self.insert_built_category(category, cv)
 
     def get_all_categories(self) -> List[str]:
         """获取所有类别名称"""
