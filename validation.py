@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import math
 import re
 from dataclasses import dataclass
@@ -42,6 +44,56 @@ RE_WEATHER_WILL_HIGHEST = re.compile(
     re.IGNORECASE,
 )
 RE_WILL_WIN_THE = re.compile(r"(?i)will\s+.+\s+win\s+the\s+")
+# `EsportsTournamentWinnerVsSportsGoalsValidator`：Will X win <赛事>…（无 vs）
+RE_WILL_WIN_EVENT = re.compile(r"(?i)will\s+.+\s+win\s+")
+
+# 与 Rust `EsportsTournamentWinnerVsSportsGoalsValidator::has_esports_series_anchor` 一致
+ESPORTS_SERIES_ANCHORS = (
+    "dreamhack",
+    "esl one",
+    "esl pro",
+    "esl challenge",
+    "esl ",
+    "blast",
+    "iem ",
+    " iem",
+    " vct",
+    "vct ",
+    "valorant champions",
+    "lck",
+    "lec",
+    "lcs",
+    "lol worlds",
+    "league of legends",
+    " worlds 20",
+    "the international",
+    "dota 2",
+    "dota2",
+    "dota ",
+    "counter-strike",
+    "counter strike",
+    "cs2",
+    "cs:go",
+    "cs go",
+    "faceit",
+    "pgl ",
+    " pgl",
+    "six invitational",
+    "rainbow six",
+    "rlcs",
+    "rocket league",
+    "overwatch",
+    "fortnite",
+    "pubg",
+    "starcraft",
+    "evo 20",
+    "capcom cup",
+    "tekken",
+    "smash bros",
+    "fighting games",
+    "esports",
+    "e-sports",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +735,38 @@ class ExactScoreVsGoalsTotalsValidator:
         pm_go = ExactScoreVsGoalsTotalsValidator.is_goals_totals_line(pm_title)
         ks_go = ExactScoreVsGoalsTotalsValidator.is_goals_totals_line(kalshi_title)
         return not ((pm_ex and ks_go) or (ks_ex and pm_go))
+
+
+class EsportsTournamentWinnerVsSportsGoalsValidator:
+    """电竞「Will X win 大赛」vs 传统体育进球盘（与 Rust 一致）。"""
+
+    @staticmethod
+    def is_will_side_win_event_proposition(title: str) -> bool:
+        main = title.split(" - ", 1)[0].strip()
+        lm = main.lower()
+        if " vs " in lm or " vs." in lm:
+            return False
+        return bool(RE_WILL_WIN_EVENT.search(main))
+
+    @staticmethod
+    def has_esports_series_anchor(title: str) -> bool:
+        l = title.lower()
+        return any(a in l for a in ESPORTS_SERIES_ANCHORS)
+
+    @staticmethod
+    def allows_pair(pm_title: str, kalshi_title: str) -> bool:
+        for a, b in ((pm_title, kalshi_title), (kalshi_title, pm_title)):
+            if (
+                EsportsTournamentWinnerVsSportsGoalsValidator.is_will_side_win_event_proposition(
+                    a
+                )
+                and EsportsTournamentWinnerVsSportsGoalsValidator.has_esports_series_anchor(
+                    a
+                )
+                and ExactScoreVsGoalsTotalsValidator.is_goals_totals_line(b)
+            ):
+                return False
+        return True
 
 
 class TournamentOutrightVsMatchValidator:
@@ -1364,6 +1448,15 @@ class ValidationPipeline:
                 pm_title, kalshi_title, "确切比分与总进球数不能匹配"
             )
             return None
+        if not EsportsTournamentWinnerVsSportsGoalsValidator.allows_pair(
+            pm_title, kalshi_title
+        ):
+            self._record_filter(
+                pm_title,
+                kalshi_title,
+                "电竞赛事夺冠命题与体育进球Totals不能匹配",
+            )
+            return None
         if not TournamentOutrightVsMatchValidator.allows_pair(
             pm_title, kalshi_title
         ):
@@ -1540,3 +1633,28 @@ class ValidationPipeline:
                 print(f"       ... 还有 {len(samples) - 3} 个")
         if len(categories) > 5:
             print(f"   ... 以及其他 {len(categories) - 5} 个类别")
+
+
+def _validation_smoke_tests() -> None:
+    """与 Rust `validation.rs` 中关键用例对齐的烟测。"""
+    pm = "Will Cloud9 New York win DreamHack Major 2?"
+    ks = "New York R wins by over 2.5 goals? - New York R wins by over 2.5 goals"
+    assert not EsportsTournamentWinnerVsSportsGoalsValidator.allows_pair(pm, ks)
+    pipe = ValidationPipeline()
+    # Windows 控制台常为 GBK，_record_filter 含 emoji 会 UnicodeEncodeError
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert pipe.validate(pm, ks, 0.95, "esports") is None
+    assert EsportsTournamentWinnerVsSportsGoalsValidator.allows_pair(
+        "Will FaZe win IEM Cologne?",
+        "FaZe vs NaVi Winner? - FaZe",
+    )
+    assert EsportsTournamentWinnerVsSportsGoalsValidator.allows_pair(
+        "Will Arsenal win the Premier League?",
+        "Arsenal vs Chelsea: Over 2.5 goals?",
+    )
+    print("validation.py smoke tests OK")
+
+
+if __name__ == "__main__":
+    _validation_smoke_tests()
