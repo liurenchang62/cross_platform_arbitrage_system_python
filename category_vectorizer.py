@@ -49,7 +49,7 @@ class CategoryVectorizer:
 
         if index_items:
             if total > 1000:
-                print(f"          构建 K-D Tree ({len(index_items)} 个点)...")
+                print(f"          构建精确余弦索引 ({len(index_items)} 条向量)...")
             self.index.build(index_items)
 
     def find_similar(

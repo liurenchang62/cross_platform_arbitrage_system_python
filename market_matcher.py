@@ -1,5 +1,5 @@
 # market_matcher.py
-#! 市场匹配器，使用 TF-IDF + K-D Tree 实现快速准确的市场匹配
+#! 市场匹配器：TF-IDF 文本向量 + 类内精确余弦（堆叠矩阵点积）检索，与 Rust 一致
 
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Set, Any
