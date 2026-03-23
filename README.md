@@ -30,7 +30,7 @@ Same definition as the Rust project:
 ## Requirements
 
 - **Python** 3.10+ recommended
-- Dependencies: see `requirements.txt`
+- Dependencies: see `requirements.txt` (includes `snowballstemmer` for English stemming, matching Rust `rust_stemmers`)
 - Network access to Polymarket and Kalshi public APIs
 
 ## Quick start

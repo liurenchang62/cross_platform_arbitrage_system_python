@@ -73,9 +73,15 @@ def parse_polymarket_gamma_market_row(
         try:
             prices = json.loads(prices_str)
             if isinstance(prices, list) and len(prices) >= 2:
-                yes_price = float(prices[0])
-                no_price = float(prices[1])
+                yes_price = float(str(prices[0]).strip())
+                no_price = float(str(prices[1]).strip())
         except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    elif isinstance(prices_str, list) and len(prices_str) >= 2:
+        try:
+            yes_price = float(str(prices_str[0]).strip())
+            no_price = float(str(prices_str[1]).strip())
+        except (TypeError, ValueError):
             pass
 
     best_ask = market_data.get("bestAsk")
@@ -284,95 +290,16 @@ class PolymarketClient:
                     if tag:
                         tags.append(tag)
 
-            category = event_data.get("category")
+            raw_cat = event_data.get("category")
+            category = raw_cat if isinstance(raw_cat, str) else None
 
-            # 获取该事件下的所有市场
             if "markets" in event_data and isinstance(event_data["markets"], list):
                 for market_data in event_data["markets"]:
-                    # 过滤已关闭或已结算的市场
-                    is_closed = market_data.get("closed", True)
-                    is_resolved = market_data.get("umaResolutionStatus") == "resolved"
-
-                    if is_closed or is_resolved:
+                    if not isinstance(market_data, dict):
                         continue
-
-                    market_id = market_data.get("id", "")
-                    question = market_data.get("question", "")
-
-                    # 解析 outcomePrices
-                    yes_price = 0.0
-                    no_price = 0.0
-                    prices_str = market_data.get("outcomePrices")
-                    if prices_str and isinstance(prices_str, str):
-                        try:
-                            prices = json.loads(prices_str)
-                            if len(prices) >= 2:
-                                yes_price = float(prices[0])
-                                no_price = float(prices[1])
-                        except:
-                            pass
-
-                    # 获取其他价格字段
-                    best_ask = market_data.get("bestAsk")
-                    if best_ask is not None:
-                        best_ask = float(best_ask)
-
-                    best_bid = market_data.get("bestBid")
-                    if best_bid is not None:
-                        best_bid = float(best_bid)
-
-                    last_trade_price = market_data.get("lastTradePrice")
-                    if last_trade_price is not None:
-                        last_trade_price = float(last_trade_price)
-
-                    # 成交量
-                    volume_24h = market_data.get("volume24hr", 0.0)
-                    if volume_24h is None:
-                        volume_24h = 0.0
-                    else:
-                        try:
-                            volume_24h = float(volume_24h)
-                        except:
-                            volume_24h = 0.0
-
-                    # 解析 token_ids
-                    token_ids = []
-                    token_ids_str = market_data.get("clobTokenIds")
-                    if token_ids_str and isinstance(token_ids_str, str):
-                        try:
-                            token_ids = json.loads(token_ids_str)
-                        except:
-                            pass
-
-                    # 解析到期日
-                    resolution_date = None
-                    end_date = market_data.get("endDate")
-                    if end_date:
-                        try:
-                            resolution_date = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                        except:
-                            pass
-
-                    market = Market(
-                        platform="polymarket",
-                        market_id=market_id,
-                        title=question,
-                        description=market_data.get("description", ""),
-                        resolution_date=resolution_date,
-                        category=category,
-                        tags=tags.copy(),
-                        slug=market_data.get("slug"),
-                        token_ids=token_ids,
-                        outcome_prices=(yes_price, no_price) if yes_price or no_price else None,
-                        best_ask=best_ask,
-                        best_bid=best_bid,
-                        last_trade_price=last_trade_price,
-                        vector_cache=None,
-                        categories=[],
-                        volume_24h=volume_24h,
-                    )
-
-                    markets.append(market)
+                    m = parse_polymarket_gamma_market_row(market_data, category, tags)
+                    if m is not None:
+                        markets.append(m)
 
         return markets
 

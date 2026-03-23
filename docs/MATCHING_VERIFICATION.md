@@ -41,4 +41,5 @@ python main.py
 
 ---
 
-Python 版使用 `numpy` 做点积检索，与 Rust `ndarray` 矩阵乘法语义对齐。
+Python 版使用 `numpy` 做点积检索，与 Rust `ndarray` 矩阵乘法语义对齐。  
+文本向量化与 Rust 一致：`snowballstemmer`（English）词干、`ceil(max_df_ratio * n_docs)` 的文档频率上限、与 Rust 相同的分词边界（保留 `-`、按非标点切分）。

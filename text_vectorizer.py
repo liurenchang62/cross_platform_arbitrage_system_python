@@ -1,20 +1,23 @@
 # text_vectorizer.py
-#! TF-IDF 文本向量化模块
+#! TF-IDF 文本向量化模块（与 Rust `text_vectorizer.rs` 对齐：分词、Snowball English 词干、ceil(max_df)、IDF）
+
+from __future__ import annotations
+
+import copy
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
 
 import numpy as np
-from typing import List, Dict, Set, Optional, Tuple
-from dataclasses import dataclass, field
-import re
-from collections import Counter, defaultdict
-import math
+import snowballstemmer
 
 from query_params import MAX_VOCAB_SIZE
 
 
-# 停用词集合（常见无意义词语）
 def get_stop_words() -> Set[str]:
-    """获取停用词集合"""
-    stop_words = {
+    """与 Rust `get_stop_words` 列表一致"""
+    return {
         "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is",
         "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there",
         "these", "they", "this", "to", "was", "will", "with", "would", "am", "been", "being",
@@ -28,12 +31,27 @@ def get_stop_words() -> Set[str]:
         "contract", "share", "stock", "binary", "option", "trade", "trading",
         "buy", "sell", "yes", "no", "up", "down", "over", "under",
     }
-    return stop_words
+
+
+def _split_words_rust_style(text: str) -> List[str]:
+    """等价 Rust: split(|c: char| !c.is_alphanumeric() && c != '-')"""
+    text = text.lower()
+    words: List[str] = []
+    current: List[str] = []
+    for ch in text:
+        if ch.isalnum() or ch == "-":
+            current.append(ch)
+        else:
+            if current:
+                words.append("".join(current))
+                current = []
+    if current:
+        words.append("".join(current))
+    return [w for w in words if w]
 
 
 @dataclass
 class VectorizerConfig:
-    """文本向量化器配置"""
     use_stemming: bool = True
     filter_stop_words: bool = True
     min_word_length: int = 2
@@ -45,32 +63,44 @@ class VectorizerConfig:
 
 
 class TextVectorizer:
-    """文本向量化器"""
+    """文本向量化器（与 Rust `TextVectorizer` 行为对齐）"""
 
     def __init__(self, config: VectorizerConfig):
         self.config = config
         self.stop_words = get_stop_words()
-        # 添加自定义停用词
         for word in config.custom_stop_words:
             self.stop_words.add(word)
+
+        self._stemmer = snowballstemmer.stemmer("english") if config.use_stemming else None
 
         self.vocabulary: Dict[str, int] = {}
         self.idf: List[float] = []
         self.n_docs = 0
         self.fitted = False
 
+    def __deepcopy__(self, memo: dict) -> "TextVectorizer":
+        """并行建索引时 `deepcopy(vectorizer)`：重建 Snowball stemmer（不可 pickle 时安全）。"""
+        dup = object.__new__(TextVectorizer)
+        memo[id(self)] = dup
+        dup.config = copy.deepcopy(self.config, memo)
+        dup.stop_words = get_stop_words()
+        for word in dup.config.custom_stop_words:
+            dup.stop_words.add(word)
+        dup._stemmer = snowballstemmer.stemmer("english") if dup.config.use_stemming else None
+        dup.vocabulary = copy.deepcopy(self.vocabulary, memo)
+        dup.idf = list(self.idf)
+        dup.n_docs = self.n_docs
+        dup.fitted = self.fitted
+        return dup
+
     def tokenize(self, text: str) -> List[str]:
-        """分词"""
-        text = text.lower()
-
-        # 使用正则分割
-        words = re.findall(r'[a-zA-Z0-9-]+', text)
-
-        result = []
+        words = _split_words_rust_style(text)
+        result: List[str] = []
         for word in words:
-            if '-' in word:
-                # 处理带连字符的词
-                for part in word.split('-'):
+            if "-" in word:
+                for part in word.split("-"):
+                    if not part:
+                        continue
                     processed = self._process_token(part)
                     if processed:
                         result.append(processed)
@@ -78,84 +108,62 @@ class TextVectorizer:
                 processed = self._process_token(word)
                 if processed:
                     result.append(processed)
-
         return result
 
     def _process_token(self, token: str) -> Optional[str]:
-        """处理单个token"""
-        # 纯数字处理
-        if token.isdigit():
-            if len(token) == 4 and token.startswith(('1', '2')):
+        # 纯 ASCII 数字（与 Rust `is_ascii_digit` 一致）
+        if token and all("0" <= c <= "9" for c in token):
+            if len(token) == 4 and token[0] in ("1", "2"):
                 return f"YEAR_{token}"
             return None
 
-        # 长度检查
         if len(token) < self.config.min_word_length:
             return None
 
-        # 停用词检查
         if self.config.filter_stop_words and token in self.stop_words:
             return None
 
-        # 简易词干提取（仅去除常见后缀）
-        if self.config.use_stemming:
-            if token.endswith('ing'):
-                token = token[:-3]
-            elif token.endswith('ed'):
-                token = token[:-2]
-            elif token.endswith('s') and len(token) > 3:
-                token = token[:-1]
-
+        if self._stemmer is not None:
+            return self._stemmer.stemWord(token)
         return token
 
-    def fit(self, documents: List[str]) -> 'TextVectorizer':
-        """拟合向量化器"""
+    def fit(self, documents: List[str]) -> "TextVectorizer":
         if not documents:
             return self
 
         self.n_docs = len(documents)
-
-        # 对所有文档进行分词
         all_tokens = [self.tokenize(doc) for doc in documents]
 
-        # 计算文档频率
-        doc_freq = defaultdict(int)
+        doc_freq: Dict[str, int] = defaultdict(int)
         for tokens in all_tokens:
-            unique_tokens = set(tokens)
-            for token in unique_tokens:
+            for token in set(tokens):
                 doc_freq[token] += 1
 
-        # 过滤高频词和低频词
-        max_df = int(self.config.max_df_ratio * self.n_docs)
+        # Rust: (max_df_ratio * n_docs).ceil() as usize
+        max_df = int(math.ceil(self.config.max_df_ratio * float(self.n_docs)))
+
         vocab_with_freq = [
-            (token, df) for token, df in doc_freq.items()
+            (token, df)
+            for token, df in doc_freq.items()
             if df >= self.config.min_df and df <= max_df
         ]
-
-        # 按文档频率降序排序
         vocab_with_freq.sort(key=lambda x: x[1], reverse=True)
 
-        # 如果有上限，截取前 max_features 个
-        if self.config.max_features and len(vocab_with_freq) > self.config.max_features:
-            vocab_with_freq = vocab_with_freq[:self.config.max_features]
+        if self.config.max_features is not None and len(vocab_with_freq) > self.config.max_features:
+            vocab_with_freq = vocab_with_freq[: self.config.max_features]
 
-        # 构建词汇表
-        self.vocabulary = {token: i for i, (token, _) in enumerate(vocab_with_freq)}
+        self.vocabulary = {word: i for i, (word, _) in enumerate(vocab_with_freq)}
 
-        # 计算IDF
         vocab_size = len(self.vocabulary)
         self.idf = [0.0] * vocab_size
 
-        # 重新计算过滤后的文档频率
         filtered_doc_freq = [0] * vocab_size
         for tokens in all_tokens:
-            unique_tokens = set(tokens)
-            for token in unique_tokens:
-                if token in self.vocabulary:
-                    idx = self.vocabulary[token]
+            for token in set(tokens):
+                idx = self.vocabulary.get(token)
+                if idx is not None:
                     filtered_doc_freq[idx] += 1
 
-        # 计算IDF值
         for idx, df in enumerate(filtered_doc_freq):
             if df > 0:
                 self.idf[idx] = math.log((1.0 + self.n_docs) / (1.0 + df)) + 1.0
@@ -166,49 +174,42 @@ class TextVectorizer:
         return self
 
     def transform(self, text: str) -> Optional[np.ndarray]:
-        """将文本转换为向量"""
         if not self.fitted or not self.vocabulary:
             return None
 
         tokens = self.tokenize(text)
-        vector = np.zeros(len(self.vocabulary))
+        vector = np.zeros(len(self.vocabulary), dtype=np.float64)
 
-        # 计算词频
         for token in tokens:
-            if token in self.vocabulary:
-                idx = self.vocabulary[token]
+            idx = self.vocabulary.get(token)
+            if idx is not None:
                 vector[idx] += 1.0
 
         if np.all(vector == 0):
             return None
 
-        # 应用IDF
         for idx, val in enumerate(vector):
             if val > 0:
                 vector[idx] = val * self.idf[idx]
 
-        # L2归一化
         if self.config.normalize:
-            norm = np.linalg.norm(vector)
+            norm = float(np.linalg.norm(vector))
             if norm > 1e-12:
                 vector = vector / norm
 
         return vector
 
     def vocab_size(self) -> int:
-        """获取词汇表大小"""
         return len(self.vocabulary)
 
     def is_fitted(self) -> bool:
-        """检查是否已拟合"""
         return self.fitted
 
 
 def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
-    """计算余弦相似度"""
     dot = np.dot(v1, v2)
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
     if norm1 == 0 or norm2 == 0:
         return 0.0
-    return dot / (norm1 * norm2)
+    return float(dot / (norm1 * norm2))
