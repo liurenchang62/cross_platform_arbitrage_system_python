@@ -3,10 +3,131 @@ import requests
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from market import Market, MarketPrices
 from query_params import *
+
+
+def _parse_rfc3339_field(market_data: dict, key: str) -> Optional[datetime]:
+    v = market_data.get(key)
+    if v is None or v == "":
+        return None
+    s = v.strip() if isinstance(v, str) else str(v).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_polymarket_market_resolution_date(market_data: dict) -> Optional[datetime]:
+    for key in ("endDate", "end_date"):
+        s = market_data.get(key)
+        if s and isinstance(s, str) and s.strip():
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+    s = market_data.get("endDateIso")
+    if s and isinstance(s, str) and s.strip():
+        try:
+            d = datetime.strptime(s.strip(), "%Y-%m-%d").date()
+            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def parse_kalshi_market_resolution_date(market_data: dict) -> Optional[datetime]:
+    for key in ("expected_expiration_time", "expiration_time", "close_time", "latest_expiration_time"):
+        dt = _parse_rfc3339_field(market_data, key)
+        if dt is not None:
+            return dt
+    return None
+
+
+def parse_polymarket_gamma_market_row(
+    market_data: dict,
+    category: Optional[str],
+    tags: Optional[List[str]],
+) -> Optional[Market]:
+    """Gamma 单条 market JSON → Market（与 Rust `parse_polymarket_gamma_market_row` 对齐）。"""
+    is_closed = market_data.get("closed", True)
+    if not isinstance(is_closed, bool):
+        is_closed = bool(is_closed)
+    is_resolved = market_data.get("umaResolutionStatus") == "resolved"
+    if is_closed or is_resolved:
+        return None
+
+    market_id = str(market_data.get("id") or "").strip()
+    if not market_id:
+        return None
+    question = str(market_data.get("question") or "")
+
+    yes_price = 0.0
+    no_price = 0.0
+    prices_str = market_data.get("outcomePrices")
+    if isinstance(prices_str, str):
+        try:
+            prices = json.loads(prices_str)
+            if isinstance(prices, list) and len(prices) >= 2:
+                yes_price = float(prices[0])
+                no_price = float(prices[1])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    best_ask = market_data.get("bestAsk")
+    if best_ask is not None:
+        best_ask = float(best_ask)
+    best_bid = market_data.get("bestBid")
+    if best_bid is not None:
+        best_bid = float(best_bid)
+    ltp = market_data.get("lastTradePrice")
+    if ltp is not None:
+        ltp = float(ltp)
+
+    vol = market_data.get("volume24hr")
+    if vol is None:
+        volume_24h = 0.0
+    else:
+        try:
+            volume_24h = float(vol)
+        except (TypeError, ValueError):
+            volume_24h = 0.0
+
+    token_ids: List[str] = []
+    tid = market_data.get("clobTokenIds")
+    if isinstance(tid, str):
+        try:
+            parsed = json.loads(tid)
+            if isinstance(parsed, list):
+                token_ids = parsed
+        except json.JSONDecodeError:
+            pass
+
+    resolution_date = parse_polymarket_market_resolution_date(market_data)
+    tag_list = list(tags) if tags else []
+
+    return Market(
+        platform="polymarket",
+        market_id=market_id,
+        title=question,
+        description=str(market_data.get("description") or ""),
+        resolution_date=resolution_date,
+        category=category,
+        tags=tag_list,
+        slug=market_data.get("slug"),
+        token_ids=token_ids,
+        outcome_prices=(yes_price, no_price),
+        best_ask=best_ask,
+        best_bid=best_bid,
+        last_trade_price=ltp,
+        vector_cache=None,
+        categories=[],
+        volume_24h=volume_24h,
+    )
 
 
 class PriceCacheEntry:
@@ -33,6 +154,9 @@ class PriceCache:
 
     async def set(self, key: str, prices: MarketPrices):
         self.entries[key] = PriceCacheEntry(prices, datetime.now())
+
+    async def clear(self) -> None:
+        self.entries.clear()
 
 
 class PolymarketClient:
@@ -292,10 +416,35 @@ class PolymarketClient:
         params = {"token_id": token_id}
 
         try:
-            data = await self._request("GET", url, params=params)
-            return data
-        except Exception as e:
-            print(f"获取Polymarket订单簿失败: {e}")
+            return await self._request("GET", url, params=params)
+        except Exception:
+            return None
+
+    async def clear_price_cache(self) -> None:
+        await self.price_cache.clear()
+
+    async def fetch_market_snapshot_by_id(self, market_id: str) -> Market:
+        if not str(market_id).strip():
+            raise ValueError("empty polymarket market_id")
+        url = f"{self.GAMMA_API_BASE}/markets"
+        arr = await self._request("GET", url, params={"id": market_id, "limit": "1"})
+        if not arr or not isinstance(arr, list) or not arr:
+            raise ValueError(f"Polymarket market not found: {market_id}")
+        m = parse_polymarket_gamma_market_row(arr[0], None, [])
+        if m is None:
+            raise ValueError(f"Polymarket market closed or unparsable: {market_id}")
+        return m
+
+    async def fetch_resolution_by_market_id(self, market_id: str) -> Optional[datetime]:
+        if not str(market_id).strip():
+            return None
+        url = f"{self.GAMMA_API_BASE}/markets"
+        try:
+            arr = await self._request("GET", url, params={"id": market_id, "limit": "1"})
+            if not arr or not isinstance(arr, list) or not arr:
+                return None
+            return parse_polymarket_market_resolution_date(arr[0])
+        except Exception:
             return None
 
     async def __aenter__(self):
@@ -383,8 +532,8 @@ class KalshiClient:
                 if series:
                     category = event.get("category")
                     series_category_map[series] = category
-        except Exception as e:
-            print(f"      获取系列信息失败: {e}")
+        except Exception:
+            pass
 
         # 第二步：分页获取所有市场
         page_count = 0
@@ -596,10 +745,24 @@ class KalshiClient:
         url = f"{self.base_url}/markets/{ticker}/orderbook"
 
         try:
+            return await self._request("GET", url)
+        except Exception:
+            return None
+
+    async def clear_price_cache(self) -> None:
+        await self.price_cache.clear()
+
+    async def fetch_resolution_by_ticker(self, ticker: str) -> Optional[datetime]:
+        if not str(ticker).strip():
+            return None
+        url = f"{self.base_url}/markets/{ticker}"
+        try:
             data = await self._request("GET", url)
-            return data
-        except Exception as e:
-            print(f"获取Kalshi订单簿失败: {e}")
+            m = data.get("market")
+            if not m:
+                return None
+            return parse_kalshi_market_resolution_date(m)
+        except Exception:
             return None
 
     async def __aenter__(self):
