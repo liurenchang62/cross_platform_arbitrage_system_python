@@ -1,5 +1,5 @@
 # tracking.py
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -24,7 +24,7 @@ class TrackedArbitrage:
 
     def __post_init__(self):
         if self.last_check is None:
-            self.last_check = datetime.now()
+            self.last_check = datetime.now(timezone.utc)
 
     @classmethod
     def new(

@@ -6,9 +6,20 @@ import csv
 from datetime import datetime, timedelta
 from typing import List, Set, Optional, Dict, Tuple
 from pathlib import Path
-from collections import Counter
 
 from market import Market
+
+
+def _trim_non_alphanumeric_edges(word: str) -> str:
+    """与 Rust `trim_matches(|c: char| !c.is_alphanumeric())` 一致：去掉两端非字母数字字符。"""
+    if not word:
+        return word
+    start, end = 0, len(word)
+    while start < end and not word[start].isalnum():
+        start += 1
+    while start < end and not word[end - 1].isalnum():
+        end -= 1
+    return word[start:end]
 
 
 class UnclassifiedLogger:
@@ -70,8 +81,8 @@ class UnclassifiedLogger:
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 market.market_id,
                 market.platform,
-                market.title.replace('"', '""'),  # CSV 转义
-                ','.join(keywords[:10])  # 最多10个关键词
+                market.title,
+                ','.join(keywords),
             ])
 
     def log_batch_unclassified(self, markets: List[Market]) -> int:
