@@ -34,5 +34,12 @@ MAX_VOCAB_SIZE = None
 # 相似度阈值
 SIMILARITY_THRESHOLD = 0.8
 
+# 每个 (query, 类别) 在索引中保留的候选条数（与 Rust 一致）
+SIMILARITY_TOP_K = 7
+
 # 全量获取周期（每 N 个追踪周期执行一次全量获取；与 Rust 一致）
 FULL_FETCH_INTERVAL = 180
+
+# ==================== 市场时间窗口 ====================
+# 仅保留解析日在「当前 UTC + 本天数」及以内的市场；无解析日期的市场保留。
+RESOLUTION_HORIZON_DAYS = 21

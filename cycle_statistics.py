@@ -1,4 +1,5 @@
 # cycle_statistics.py — 与 Rust `cycle_statistics.rs` 对齐
+# 大周期边界仅 `reset_big_period_accumulator()`，不输出「上一大周期总绩效」。
 from __future__ import annotations
 
 import threading
@@ -63,65 +64,11 @@ def record_opportunity(opp: "ArbitrageOpportunity") -> None:
         bp.sum_net_profit += opp.net_profit_100
 
 
-def flush_big_period_report_at_boundary(current_cycle: int, interval: int) -> str:
+def reset_big_period_accumulator() -> None:
+    """在下一全量匹配周期开始前调用：仅清零大周期累加器，不打印、不写报表（与 Rust 一致）。"""
     global _BIG_PERIOD
-    ended_period_no = current_cycle // interval
-    n_track = max(0, interval - 1)
-
     with _LOCK:
-        bp = _BIG_PERIOD
-        bp_copy = _BigPeriodStats(
-            arb_hits=bp.arb_hits,
-            sum_capital=bp.sum_capital,
-            sum_gas=bp.sum_gas,
-            sum_fees=bp.sum_fees,
-            sum_gross_payout=bp.sum_gross_payout,
-            sum_net_profit=bp.sum_net_profit,
-        )
         _BIG_PERIOD = _BigPeriodStats()
-        g = _CumulativeStats(
-            arb_hits=_GLOBAL.arb_hits,
-            sum_capital=_GLOBAL.sum_capital,
-            sum_gas=_GLOBAL.sum_gas,
-            sum_fees=_GLOBAL.sum_fees,
-            sum_gross_payout=_GLOBAL.sum_gross_payout,
-            sum_net_profit=_GLOBAL.sum_net_profit,
-            full_match_cycles_completed=_GLOBAL.full_match_cycles_completed,
-        )
-
-    bp_margin = (bp_copy.sum_net_profit / bp_copy.sum_capital * 100.0) if bp_copy.sum_capital > 1e-12 else 0.0
-    global_margin = (g.sum_net_profit / g.sum_capital * 100.0) if g.sum_capital > 1e-12 else 0.0
-
-    lines: List[str] = []
-    lines.append("")
-    lines.append("╔══════════════════════════════════════════════════════════════════════╗")
-    lines.append(
-        f"║  📊 上一大周期总绩效（大周期 #{ended_period_no} 已结束 · 1 次全量匹配 + {n_track} 次价格追踪）     ║"
-    )
-    lines.append("╚══════════════════════════════════════════════════════════════════════╝")
-    lines.append("")
-    lines.append("┌─ 本大周期内累计（结帐于下一匹配周期开始前）────────────────────────────")
-    lines.append(f"│  套利识别次数:               {bp_copy.arb_hits}")
-    lines.append(f"│  总本金 Σcapital:           ${bp_copy.sum_capital:.2f}")
-    lines.append(f"│  总 Gas Σgas:               ${bp_copy.sum_gas:.2f}")
-    lines.append(f"│  总手续费 Σfees:            ${bp_copy.sum_fees:.2f}")
-    lines.append(f"│  总回报(兑付额 Σn):         ${bp_copy.sum_gross_payout:.2f}")
-    lines.append(f"│  总净利润 Σnet:             ${bp_copy.sum_net_profit:.2f}")
-    lines.append(f"│  本大周期利润率 (Σnet/Σcapital): {bp_margin:.2f}%")
-    lines.append("└────────────────────────────────────────────────────────────────────────")
-    lines.append("")
-    lines.append("┌─ 自进程启动以来累计（每次识别均独立计数，含全量+追踪周期）────────────────")
-    lines.append(f"│  已完成全量匹配周期数 N:     {g.full_match_cycles_completed}")
-    lines.append(f"│  套利识别总次数:             {g.arb_hits}")
-    lines.append(f"│  总成本 Σcapital:           ${g.sum_capital:.2f}")
-    lines.append(f"│  总 Gas Σgas:               ${g.sum_gas:.2f}")
-    lines.append(f"│  总手续费 Σfees:            ${g.sum_fees:.2f}")
-    lines.append(f"│  总回报(兑付额 Σn):         ${g.sum_gross_payout:.2f}")
-    lines.append(f"│  总净利润 Σnet:             ${g.sum_net_profit:.2f}")
-    lines.append(f"│  整体利润率 (Σnet/Σcapital): {global_margin:.2f}%")
-    lines.append("└────────────────────────────────────────────────────────────────────────")
-    lines.append("")
-    return "\n".join(lines)
 
 
 def on_full_cycle_completed(rows: List[OpportunityTuple]) -> str:
@@ -159,6 +106,8 @@ def format_full_cycle_roi_top10_only(rows: List[OpportunityTuple]) -> str:
 
 
 def _truncate_title(s: str, max_chars: int) -> str:
-    if len(s) <= max_chars:
+    """按 Unicode 字符数截断（与 Rust `chars().count()` 一致）。"""
+    chars = list(s)
+    if len(chars) <= max_chars:
         return s
-    return s[: max_chars - 3] + "..."
+    return "".join(chars[: max_chars - 3]) + "..."

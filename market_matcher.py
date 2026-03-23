@@ -11,7 +11,7 @@ import json
 from market import Market
 from category_mapper import CategoryMapper
 from unclassified_logger import UnclassifiedLogger
-from query_params import SIMILARITY_THRESHOLD
+from query_params import SIMILARITY_THRESHOLD, SIMILARITY_TOP_K
 from category_vectorizer import CategoryVectorizerManager
 from text_vectorizer import VectorizerConfig
 from validation import ValidationPipeline, MatchInfo
@@ -308,6 +308,7 @@ class MarketMatcher:
 
         print(f"      🔍 匹配 {total} 个市场 [{direction_label}]...")
         start_time = datetime.now()
+        is_kalshi_pm = direction_label == "Kalshi→PM"
 
         for idx, query_market in enumerate(query_markets):
             if idx > 0 and idx % 1000 == 0:
@@ -315,6 +316,9 @@ class MarketMatcher:
                 avg_time = elapsed.total_seconds() * 1000 / idx
                 remaining = (total - idx) * avg_time / 1000
                 print(f"        进度: {idx}/{total} 个市场 [{direction_label}], 已用 {elapsed.total_seconds():.1f}s, 预计剩余 {remaining:.1f}s")
+
+            query_full_id = f"{query_market.platform}:{query_market.market_id}"
+            seen_qt: Set[Tuple[str, str]] = set()
 
             query_categories = category_mapper.classify(query_market.title)
 
@@ -326,17 +330,24 @@ class MarketMatcher:
                 similar = vectorizer.find_similar(
                     query_market.title,
                     config.similarity_threshold,
-                    5,
+                    SIMILARITY_TOP_K,
                 )
 
                 for item, similarity in similar:
+                    if (query_full_id, item.id) in seen_qt:
+                        continue
+                    seen_qt.add((query_full_id, item.id))
+
                     target_market = market_cache.get(item.id)
                     if not target_market:
                         continue
 
+                    pm_title = target_market.title if is_kalshi_pm else query_market.title
+                    kalshi_title = query_market.title if is_kalshi_pm else target_market.title
+
                     match_info = pipeline.validate(
-                        query_market.title,
-                        target_market.title,
+                        pm_title,
+                        kalshi_title,
                         similarity,
                         category,
                     )

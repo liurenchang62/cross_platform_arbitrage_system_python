@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from market import Market, MarketPrices
+from market_filter import tracked_pair_exceeds_horizon
 
 
 @dataclass
@@ -96,3 +97,11 @@ class MonitorState:
     def get_active_pairs(self) -> List[TrackedArbitrage]:
         """获取活跃的追踪对"""
         return [p for p in self.tracked_pairs if p.active]
+
+    def prune_tracked_beyond_resolution_horizon(self, now: datetime) -> None:
+        """剔除任一侧「有解析日且晚于 horizon」的追踪对（与全量池筛选规则一致）。"""
+        self.tracked_pairs = [
+            p
+            for p in self.tracked_pairs
+            if not tracked_pair_exceeds_horizon(p.pm_market, p.kalshi_market, now)
+        ]
