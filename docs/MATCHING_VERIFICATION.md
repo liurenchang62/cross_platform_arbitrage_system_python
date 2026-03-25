@@ -4,7 +4,7 @@
 
 ## 索引检索
 
-- 每个类别内用堆叠矩阵做一次 `scores = X @ q`（L2 归一化 TF-IDF 下即**精确余弦**），再按 `score >= SIMILARITY_THRESHOLD` 过滤，取前 `SIMILARITY_TOP_K` 条（见 `query_params.py`）。
+- 每个类别内用堆叠矩阵做一次 `scores = X @ q`（L2 归一化 TF-IDF 下即**精确余弦**），再按 `score >= SIMILARITY_THRESHOLD` 过滤，取前 `SIMILARITY_TOP_K` 条（见 `system_params.py`）。
 
 ## 与「全不能变差」的关系
 
@@ -32,7 +32,7 @@ python main.py
 - `构建` / 索引与匹配进度输出  
 - `初筛匹配对`、`二筛过滤`  
 
-## 可调参数（`query_params.py`）
+## 可调参数（`system_params.py`，`query_params.py` 为兼容重导出）
 
 | 常量 | 含义 |
 |------|------|

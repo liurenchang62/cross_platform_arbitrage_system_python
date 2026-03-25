@@ -11,8 +11,9 @@ The end-to-end pipeline includes:
 - Pulling open markets from both platforms with configurable pagination and safety limits.
 - **Text-based matching** using TF-IDF–style vectors, cosine similarity, and category-aware rules driven by `config/categories.toml`.
 - A **second-pass validation** stage (`validation.py`) that filters implausible pairings (cross-sport or structurally incompatible market types) before order-book analysis.
-- Optional **resolution-horizon filtering** so that only markets expected to resolve within a configured calendar window are considered (`market_filter.py`, parameters in `query_params.py`).
+- Optional **resolution-horizon filtering** so that only markets expected to resolve within a configured calendar window are considered (`market_filter.py`, parameters in `system_params.py`).
 - **Tracking** of pairs across monitor cycles, with periodic full rebuilds of the candidate set and incremental updates for pairs already under watch (`tracking.py`).
+- **Paper trading (optional)**: When enabled in `system_params.py`, `paper_trading.py` simulates cash, open positions per verified pair, per-cycle **early exit** on combined bid liquidity (with cooldown after closes), and append-only CSV under `logs/paper_trades.csv` (session markers, `OPEN`, `CLOSE`, `NO_CLOSE`).
 - **Structured logging**: daily monitor CSV files under `logs/`, plus optional capture of hard-to-classify markets under `logs/unclassified/`.
 
 Together, these pieces support continuous monitoring for situations where the same underlying proposition may be priced differently across venues, subject to the limitations described under **Disclaimer**.
@@ -22,13 +23,13 @@ Together, these pieces support continuous monitoring for situations where the sa
 ### Market data
 
 - Loads **open** markets from the **Polymarket Gamma API** and the **Kalshi Trade API**.
-- Pagination, per-request limits, and global caps are centralized in `query_params.py` so you can tune how aggressively the monitor scans without changing core logic.
+- Pagination, per-request limits, and global caps are centralized in `system_params.py` (with `query_params.py` re-exporting the same names for compatibility) so you can tune how aggressively the monitor scans without changing core logic.
 - Market records are normalized into internal structures (`market.py`) for consistent handling in matching and logging.
 
 ### Matching and classification
 
 - **Vectorization**: English-oriented tokenization and stemming (via `snowballstemmer` in `text_vectorizer.py`) produce sparse vectors comparable in spirit to classic TF-IDF weighting.
-- **Indexing and search**: `vector_index.py` supports efficient similarity queries; `market_matcher.py` orchestrates building indices per venue, cross-querying, and applying **top‑K** and **similarity threshold** cuts from `query_params.py`.
+- **Indexing and search**: `vector_index.py` supports efficient similarity queries; `market_matcher.py` orchestrates building indices per venue, cross-querying, and applying **top‑K** and **similarity threshold** cuts from `system_params.py`.
 - **Categories**: `config/categories.toml` supplies category labels, keyword hints, and weights. `category_mapper.py` and `category_vectorizer.py` integrate category signals with text similarity so that matches are both numerically close and semantically plausible.
 
 ### Second-pass validation
@@ -38,7 +39,7 @@ Together, these pieces support continuous monitoring for situations where the sa
 
 ### Resolution horizon
 
-- `market_filter.py` can restrict the universe to markets whose **expected resolution** falls within a configured number of days ahead (`RESOLUTION_HORIZON_DAYS` and related settings in `query_params.py`), so monitoring focuses on nearer-dated events when desired.
+- `market_filter.py` can restrict the universe to markets whose **expected resolution** falls within a configured number of days ahead (`RESOLUTION_HORIZON_DAYS` and related settings in `system_params.py`), so monitoring focuses on nearer-dated events when desired.
 
 ### Execution-style profit and loss (order-book scenario)
 
@@ -48,7 +49,7 @@ Together, these pieces support continuous monitoring for situations where the sa
 
 ### Tracking across cycles
 
-- `tracking.py` records which pairs are under active watch, their last-seen similarity and profitability, and supports **full refresh** intervals versus lighter incremental passes, as configured in `query_params.py`.
+- `tracking.py` records which pairs are under active watch, their last-seen similarity and profitability, and supports **full refresh** intervals versus lighter incremental passes, as configured in `system_params.py`.
 - This allows the monitor to keep continuity across runs without re-deriving the entire opportunity set every cycle.
 
 ### Logging and auxiliary tools
@@ -58,6 +59,11 @@ Together, these pieces support continuous monitoring for situations where the sa
 - **`unclassified_logger.py`**: optional logging when markets do not map cleanly to configured categories.
 - **`check_unclassified.py`**: helper script to inspect or summarize unclassified logs.
 
+### Paper trading (simulation)
+
+- Controlled by **`PAPER_TRADING_ENABLED`** and related constants in `system_params.py` (per-leg cap aligns with **`PAPER_PER_LEG_CAP_USDT`**, same notional as the monitor’s depth-based check).
+- Writes optional **`logs/paper_trades.csv`** when **`PAPER_WRITE_TRADE_LOG`** is true; optional run label via environment variable **`PAPER_RUN_LABEL`**.
+
 ## Order-book PnL model
 
 The scenario used for ranking and reporting (for example cycle **Top 10** and **`net_profit_100`**) is defined as follows:
@@ -66,7 +72,7 @@ The scenario used for ranking and reporting (for example cycle **Top 10** and **
    For each matched pair that survives validation, the program requests the **current** Polymarket and Kalshi **order books** over HTTP and parses resting **sell-side** liquidity into **ascending ask ladders** `(price, size)`.
 
 2. **Per-leg notional cap**  
-   Each leg is allocated a maximum spend of **100 USDT** (`trade_amount` in `main.py`). The ladder is traversed **level by level** until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `arbitrage_detector.py`), yielding a **fillable contract count** per venue for that cap.
+   Each leg is allocated a maximum spend of **100 USDT** (`PAPER_PER_LEG_CAP_USDT` in `system_params.py`, assigned in `main.py` as `trade_amount`). The ladder is traversed **level by level** until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `arbitrage_detector.py`), yielding a **fillable contract count** per venue for that cap.
 
 3. **Hedged size**  
    The scenario size **n** is the **minimum** of the two per-leg contract counts so that both legs can be notionally filled at the **same** number of contracts.
@@ -100,11 +106,13 @@ Ensure **`config/categories.toml`** exists before the first run (a starter file 
 | Path | Purpose |
 |------|---------|
 | `config/categories.toml` | Category names, weights, and keyword lists used for classification-aware matching. |
-| `query_params.py` | Request pacing, page sizes, fetch caps, **`SIMILARITY_THRESHOLD`**, **`SIMILARITY_TOP_K`**, **`FULL_FETCH_INTERVAL`**, **`RESOLUTION_HORIZON_DAYS`**, and other global tuning constants. |
+| `system_params.py` | Request pacing, page sizes, fetch caps, **`SIMILARITY_THRESHOLD`**, **`SIMILARITY_TOP_K`**, **`FULL_FETCH_INTERVAL`**, **`RESOLUTION_HORIZON_DAYS`**, paper-trading toggles (`PAPER_TRADING_ENABLED`, `PAPER_PER_LEG_CAP_USDT`, …), and other global tuning constants. |
+| `query_params.py` | Re-exports `system_params` for backward-compatible imports. |
 
 ### Optional environment variables
 
 - **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted to a specific tag slug (see `clients.py`).
+- **`PAPER_RUN_LABEL`**: When paper logging is enabled, appended to CSV `notes` / session rows to tag test runs (see `system_params.PAPER_RUN_LABEL_ENV`).
 
 ## Repository layout
 
@@ -120,7 +128,9 @@ vector_index.py         Vector index and nearest-neighbor search
 validation.py           Second-pass rule pipeline for candidate pairs
 market_filter.py        Resolution-horizon and related listing filters
 arbitrage_detector.py   Order-book traversal, fees, gas, and PnL helpers
-query_params.py         Shared tuning constants and API pacing
+system_params.py        Shared tuning constants, API pacing, paper trading
+query_params.py         Re-export of system_params (compatibility)
+paper_trading.py        Optional simulated positions and trade log CSV
 tracking.py             Per-cycle watch state for tracked pairs
 monitor_logger.py       Daily CSV monitor log writer
 cycle_statistics.py     Cycle-level statistical summaries

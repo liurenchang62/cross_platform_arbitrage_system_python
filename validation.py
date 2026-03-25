@@ -46,8 +46,11 @@ RE_WEATHER_WILL_HIGHEST = re.compile(
 RE_WILL_WIN_THE = re.compile(r"(?i)will\s+.+\s+win\s+the\s+")
 # `EsportsTournamentWinnerVsSportsGoalsValidator`：Will X win <赛事>…（无 vs）
 RE_WILL_WIN_EVENT = re.compile(r"(?i)will\s+.+\s+win\s+")
+RE_OR_BELOW_F = re.compile(r"(?i)(\d+)\s*°\s*F\s*or\s+below")
+RE_OR_BELOW_PLAIN = re.compile(r"(?i)(\d+)\s*°\s*or\s+below")
+RE_WINS_BY_POINTS = re.compile(r"(?i)wins?\s+by\s+(over|under)\s+\d+\.?\d*\s*points")
 
-# 与 Rust `EsportsTournamentWinnerVsSportsGoalsValidator::has_esports_series_anchor` 一致
+# 与 `EsportsTournamentWinnerVsSportsGoalsValidator::has_esports_series_anchor` 一致
 ESPORTS_SERIES_ANCHORS = (
     "dreamhack",
     "esl one",
@@ -502,6 +505,38 @@ class WeatherValidator:
             return False
         return True
 
+    @staticmethod
+    def extract_or_below_fahrenheit_threshold(title: str) -> Optional[int]:
+        m = RE_OR_BELOW_F.search(title)
+        if m:
+            try:
+                n = int(m.group(1))
+                if 20 <= n <= 120:
+                    return n
+            except ValueError:
+                pass
+        m2 = RE_OR_BELOW_PLAIN.search(title)
+        if m2:
+            try:
+                n = int(m2.group(1))
+                if 20 <= n <= 120:
+                    return n
+            except ValueError:
+                pass
+        return None
+
+    @staticmethod
+    def fahrenheit_or_below_buckets_match(pm_title: str, kalshi_title: str) -> bool:
+        if not WeatherValidator.is_temperature_market(
+            pm_title
+        ) or not WeatherValidator.is_temperature_market(kalshi_title):
+            return True
+        pm = WeatherValidator.extract_or_below_fahrenheit_threshold(pm_title)
+        ks = WeatherValidator.extract_or_below_fahrenheit_threshold(kalshi_title)
+        if pm is not None and ks is not None:
+            return pm == ks
+        return True
+
 
 class EsportsGameValidator:
     @staticmethod
@@ -738,7 +773,11 @@ class ExactScoreVsGoalsTotalsValidator:
 
 
 class EsportsTournamentWinnerVsSportsGoalsValidator:
-    """电竞「Will X win 大赛」vs 传统体育进球盘（与 Rust 一致）。"""
+    """电竞「Will X win 大赛」vs 传统体育进球 / 净胜分 Points 盘。"""
+
+    @staticmethod
+    def is_wins_by_points_margin_line(title: str) -> bool:
+        return bool(RE_WINS_BY_POINTS.search(title))
 
     @staticmethod
     def is_will_side_win_event_proposition(title: str) -> bool:
@@ -763,7 +802,12 @@ class EsportsTournamentWinnerVsSportsGoalsValidator:
                 and EsportsTournamentWinnerVsSportsGoalsValidator.has_esports_series_anchor(
                     a
                 )
-                and ExactScoreVsGoalsTotalsValidator.is_goals_totals_line(b)
+                and (
+                    ExactScoreVsGoalsTotalsValidator.is_goals_totals_line(b)
+                    or EsportsTournamentWinnerVsSportsGoalsValidator.is_wins_by_points_margin_line(
+                        b
+                    )
+                )
             ):
                 return False
         return True
@@ -1386,6 +1430,13 @@ class ValidationPipeline:
         if not WeatherValidator.regions_match(pm_title, kalshi_title):
             self._record_filter(pm_title, kalshi_title, "天气地区不匹配")
             return None
+        if not WeatherValidator.fahrenheit_or_below_buckets_match(
+            pm_title, kalshi_title
+        ):
+            self._record_filter(
+                pm_title, kalshi_title, "温度档位(°For below)不一致"
+            )
+            return None
         if EntertainmentChartValidator.is_billboard_spotify_cross(
             pm_title, kalshi_title
         ):
@@ -1454,7 +1505,7 @@ class ValidationPipeline:
             self._record_filter(
                 pm_title,
                 kalshi_title,
-                "电竞赛事夺冠命题与体育进球Totals不能匹配",
+                "电竞赛事夺冠命题与体育进球Totals/净胜分Points盘不能匹配",
             )
             return None
         if not TournamentOutrightVsMatchValidator.allows_pair(

@@ -11,8 +11,9 @@
 - 从双方平台拉取开放市场，支持可配置的分页与安全上限。
 - 基于 **TF-IDF 风格**文本向量、**余弦相似度**，并结合 `config/categories.toml` 的**类别规则**完成文本匹配。
 - 在向量匹配之后，由 `validation.py` 执行**二筛校验流水线**，过滤跨领域或结构不兼容的伪匹配，再进入订单簿分析。
-- 通过 `market_filter.py`（参数见 `query_params.py`）按**预计解析日**做**时间窗口**筛选，使监控集中在特定期限内将结算的市场（若启用相关配置）。
+- 通过 `market_filter.py`（参数见 `system_params.py`）按**预计解析日**做**时间窗口**筛选，使监控集中在特定期限内将结算的市场（若启用相关配置）。
 - 使用 `tracking.py` 在多次监控周期之间**持续追踪**已关注市场对，在「全量重建候选集」与「增量更新」之间按参数切换。
+- **模拟盘（可选）**：在 `system_params.py` 中开启后，由 `paper_trading.py` 维护虚拟资金与持仓，按周期在双边 **bid** 上评估提前平仓，冷却后再开仓，并可写入 `logs/paper_trades.csv`（`SESSION_*`、`OPEN`、`CLOSE`、`NO_CLOSE`）。
 - 将结果写入结构化日志：按自然日划分的 `logs/` 下监控 CSV，以及可选的 `logs/unclassified/` 未分类样本记录。
 
 上述能力共同支持对「同一命题在不同场所定价是否一致」的持续观察；其实际意义与风险边界见文末**免责声明**。
@@ -22,13 +23,13 @@
 ### 市场数据
 
 - 从 **Polymarket Gamma API** 与 **Kalshi Trade API** 获取**开放**市场列表。
-- 分页大小、单次请求上限、全局拉取上限等集中在 `query_params.py`，便于在不改核心逻辑的前提下调节扫描强度。
+- 分页大小、单次请求上限、全局拉取上限等集中在 `system_params.py`（`query_params.py` 为同名常量的兼容重导出），便于在不改核心逻辑的前提下调节扫描强度。
 - 市场条目在 `market.py` 中归一化为统一结构，供匹配与日志模块使用。
 
 ### 匹配与分类
 
 - **向量化**：`text_vectorizer.py` 中对英文进行分词与词干提取（依赖 `snowballstemmer`），生成与经典 TF-IDF 思路相近的稀疏向量。
-- **索引与检索**：`vector_index.py` 提供相似度查询能力；`market_matcher.py` 负责构建各平台索引、交叉检索，并应用 `query_params.py` 中的 **Top‑K** 与**相似度阈值**截断。
+- **索引与检索**：`vector_index.py` 提供相似度查询能力；`market_matcher.py` 负责构建各平台索引、交叉检索，并应用 `system_params.py` 中的 **Top‑K** 与**相似度阈值**截断。
 - **类别信号**：`config/categories.toml` 提供类别名称、关键词与权重；`category_mapper.py` 与 `category_vectorizer.py` 将类别信息与文本相似度结合，使候选配对在数值接近的同时也符合业务上的类别一致性。
 
 ### 二筛校验（第二道过滤）
@@ -38,7 +39,7 @@
 
 ### 解析时间窗口
 
-- `market_filter.py` 可根据配置的 **`RESOLUTION_HORIZON_DAYS`** 等参数，将参与匹配的市场限制在「预计在未来若干日内解析」的子集内，便于聚焦近端事件（具体行为以 `query_params.py` 与实现为准）。
+- `market_filter.py` 可根据配置的 **`RESOLUTION_HORIZON_DAYS`** 等参数，将参与匹配的市场限制在「预计在未来若干日内解析」的子集内，便于聚焦近端事件（具体行为以 `system_params.py` 与实现为准）。
 
 ### 订单簿情景盈亏（可执行性建模）
 
@@ -48,7 +49,7 @@
 
 ### 跨周期追踪
 
-- `tracking.py` 维护当前关注列表、最近相似度与盈亏表现，并配合 `query_params.py` 中的**全量刷新间隔**等参数，在「周期性重建全集」与「增量维护」之间切换。
+- `tracking.py` 维护当前关注列表、最近相似度与盈亏表现，并配合 `system_params.py` 中的**全量刷新间隔**等参数，在「周期性重建全集」与「增量维护」之间切换。
 - 便于长时间运行时不必每一轮都从零重建全部候选关系。
 
 ### 日志与辅助脚本
@@ -58,6 +59,11 @@
 - **`unclassified_logger.py`**：在无法归入已配置类别时，可选地记录样本。
 - **`check_unclassified.py`**：用于查看或汇总未分类日志的辅助脚本。
 
+### 模拟盘（Paper）
+
+- 由 **`PAPER_TRADING_ENABLED`**、**`PAPER_WRITE_TRADE_LOG`** 等开关控制（见 `system_params.py`）；单腿本金上限 **`PAPER_PER_LEG_CAP_USDT`** 与监控套利验证所用本金一致。
+- 可选环境变量 **`PAPER_RUN_LABEL`**（对应 `PAPER_RUN_LABEL_ENV`）用于在 CSV 的 `notes` 中标记测试轮次。
+
 ## 订单簿盈亏模型
 
 用于展示与排序的场景（例如周期 **Top 10**、**`net_profit_100`**）在代码中定义为：
@@ -66,7 +72,7 @@
    对每个已通过校验的匹配市场对，程序通过 HTTP 获取双方**当前订单簿**，将可买入的**卖盘**流动性解析为按价格**升序**排列的档位 `(价格, 数量)`。
 
 2. **单腿本金上限**  
-   每条腿最多使用 **100 USDT**（`main.py` 中的 `trade_amount`）。在对应卖档上**逐档累加**，直至达到该本金上限或档位耗尽（`arbitrage_detector.py` 中的 `calculate_slippage_with_fixed_usdt`），得到该腿在该本金下**可成交的合约份数**。
+   每条腿最多使用 **100 USDT**（`system_params.py` 的 **`PAPER_PER_LEG_CAP_USDT`**，在 `main.py` 中赋给 `trade_amount`）。在对应卖档上**逐档累加**，直至达到该本金上限或档位耗尽（`arbitrage_detector.py` 中的 `calculate_slippage_with_fixed_usdt`），得到该腿在该本金下**可成交的合约份数**。
 
 3. **对冲规模**  
    取两腿可成交份数的**较小值**作为统一成交规模 **n**，以保证两腿可按**相同份数**同时完成上述意义上的建仓。
@@ -100,11 +106,13 @@ python main.py
 | 路径 | 说明 |
 |------|------|
 | `config/categories.toml` | 类别名称、权重与关键词列表，用于带类别约束的匹配。 |
-| `query_params.py` | 请求节奏、分页大小、拉取上限、**`SIMILARITY_THRESHOLD`**、**`SIMILARITY_TOP_K`**、**`FULL_FETCH_INTERVAL`**、**`RESOLUTION_HORIZON_DAYS`** 等全局调参常量。 |
+| `system_params.py` | 请求节奏、分页大小、拉取上限、**`SIMILARITY_THRESHOLD`**、**`SIMILARITY_TOP_K`**、**`FULL_FETCH_INTERVAL`**、**`RESOLUTION_HORIZON_DAYS`**、模拟盘相关常量等。 |
+| `query_params.py` | 对 `system_params` 的兼容重导出。 |
 
 ### 环境变量（可选）
 
 - **`POLYMARKET_TAG_SLUG`**：设置后，Polymarket 市场拉取可按指定 tag 过滤（实现见 `clients.py`）。
+- **`PAPER_RUN_LABEL`**：模拟盘写 CSV 时附加到 `notes`（见 `system_params.PAPER_RUN_LABEL_ENV`）。
 
 ## 仓库结构
 
@@ -120,7 +128,9 @@ vector_index.py         向量索引与近邻搜索
 validation.py           候选对的二筛规则流水线
 market_filter.py        解析期限等列表过滤
 arbitrage_detector.py   订单簿遍历、手续费、Gas 与盈亏计算
-query_params.py         全局常量与 API 节奏
+system_params.py        全局常量、API 节奏、模拟盘参数
+query_params.py         system_params 兼容重导出
+paper_trading.py        模拟持仓与 paper_trades.csv
 tracking.py             周期内对已追踪对的维护
 monitor_logger.py       按日 CSV 监控日志
 cycle_statistics.py     周期统计汇总

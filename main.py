@@ -1,4 +1,4 @@
-# main.py — 与 Rust `main.rs` 行为/输出对齐
+# main.py — 与参考监控主程序行为/输出对齐
 from __future__ import annotations
 
 import asyncio
@@ -14,13 +14,12 @@ from market_matcher import MarketMatcher, MarketMatcherConfig
 from arbitrage_detector import (
     ArbitrageDetector,
     ArbitrageOpportunity,
-    orderbook_best_ask_price,
-    parse_kalshi_orderbook,
-    parse_polymarket_orderbook,
+    build_pair_orderbook_ladders,
 )
 from monitor_logger import MonitorLogger
 from tracking import MonitorState
-from query_params import FULL_FETCH_INTERVAL, SIMILARITY_THRESHOLD
+from system_params import FULL_FETCH_INTERVAL, PAPER_PER_LEG_CAP_USDT, SIMILARITY_THRESHOLD
+from paper_trading import PaperEngine, validate_opportunity_from_ladders
 import cycle_statistics
 
 OpportunityRow = Tuple[ArbitrageOpportunity, str, str, Optional[datetime], Optional[datetime]]
@@ -60,37 +59,24 @@ async def validate_arbitrage_pair(
     cycle_id: int,
     cycle_phase: str,
     logger: MonitorLogger,
+    pair_label: str,
+    paper: Optional[PaperEngine],
 ) -> Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime]]]:
-    pm_orderbook_vec: List[Tuple[float, float]] = []
-    if pm_market.token_ids:
-        tid = pm_market.token_ids[0]
-        ob_data = await polymarket.get_order_book(tid)
-        if ob_data:
-            parsed = parse_polymarket_orderbook(ob_data, pm_side)
-            if parsed:
-                pm_orderbook_vec = parsed
-    if not pm_orderbook_vec:
+    if not pm_market.token_ids:
+        return None
+    tid = pm_market.token_ids[0]
+    pm_book = await polymarket.get_order_book(tid)
+    ks_book = await kalshi.get_order_book(kalshi_market.market_id)
+    if not pm_book or not ks_book:
         return None
 
-    kalshi_orderbook_vec: List[Tuple[float, float]] = []
-    ob_ks = await kalshi.get_order_book(kalshi_market.market_id)
-    if ob_ks:
-        parsed_ks = parse_kalshi_orderbook(ob_ks, kalshi_side)
-        if parsed_ks:
-            kalshi_orderbook_vec = parsed_ks
-    if not kalshi_orderbook_vec:
+    ladders = build_pair_orderbook_ladders(pm_book, ks_book, pm_side, kalshi_side)
+    if ladders is None:
         return None
 
-    pm_opt = orderbook_best_ask_price(pm_orderbook_vec)
-    ks_opt = orderbook_best_ask_price(kalshi_orderbook_vec)
-    if pm_opt is None or ks_opt is None:
-        return None
-
-    opp = arb_detector.calculate_arbitrage_100usdt(
-        pm_opt,
-        ks_opt,
-        pm_orderbook_vec,
-        kalshi_orderbook_vec,
+    opp = validate_opportunity_from_ladders(
+        arb_detector,
+        ladders,
         pm_side,
         kalshi_side,
         needs_inversion,
@@ -98,6 +84,9 @@ async def validate_arbitrage_pair(
     )
     if opp is None:
         return None
+
+    pm_orderbook_vec = ladders.pm_asks
+    kalshi_orderbook_vec = ladders.ks_asks
 
     inv = " (Y/N颠倒)" if needs_inversion else ""
     pm_slip = ((opp.pm_avg_slipped - opp.pm_optimal) / opp.pm_optimal * 100.0) if opp.pm_optimal > 0.0 else 0.0
@@ -166,7 +155,61 @@ async def validate_arbitrage_pair(
     except Exception as e:
         print(f"         ⚠️ 写入监控 CSV 失败: {e}")
 
+    if paper is not None:
+        try:
+            paper.try_open(
+                pair_label,
+                opp,
+                pm_side,
+                kalshi_side,
+                cycle_id,
+                pm_market.market_id,
+                kalshi_market.market_id,
+                tid,
+                datetime.now(timezone.utc),
+            )
+        except Exception as e:
+            print(f"   ⚠️ [Paper] try_open 失败: {e}")
+
     return (opp, pm_expiry, ks_expiry)
+
+
+async def paper_cycle_start_close_checks(
+    polymarket: PolymarketClient,
+    kalshi: KalshiClient,
+    paper: Optional[PaperEngine],
+    cycle_id: int,
+) -> None:
+    if paper is None:
+        return
+    positions = paper.snapshot_open_positions()
+    if not positions:
+        return
+    check_time = datetime.now(timezone.utc)
+    for pos in positions:
+        pm_book = await polymarket.get_order_book(pos.pm_token_id)
+        if pm_book is None:
+            paper.log_no_close_book_error(
+                pos, cycle_id, check_time, "pm_orderbook_fetch_failed"
+            )
+            continue
+        ks_book = await kalshi.get_order_book(pos.kalshi_market_id)
+        if ks_book is None:
+            paper.log_no_close_book_error(
+                pos, cycle_id, check_time, "kalshi_orderbook_fetch_failed"
+            )
+            continue
+        ladders = build_pair_orderbook_ladders(
+            pm_book, ks_book, pos.pm_side, pos.kalshi_side
+        )
+        if ladders is None:
+            paper.log_no_close_book_error(
+                pos, cycle_id, check_time, "orderbook_parse_failed"
+            )
+            continue
+        paper.check_early_close_at_cycle(
+            pos.pair_label, ladders, cycle_id, check_time
+        )
 
 
 def format_top10_opportunities(opportunities: List[OpportunityRow]) -> str:
@@ -224,6 +267,7 @@ async def run_full_match_cycle(
     logger: MonitorLogger,
     monitor_state: MonitorState,
     trade_amount: float,
+    paper: Optional[PaperEngine],
 ) -> Tuple[int, int, str, str]:
     print("   📡 执行全量匹配...")
 
@@ -256,6 +300,7 @@ async def run_full_match_cycle(
     opportunities: List[OpportunityRow] = []
 
     for pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion in matches:
+        pair_label = f"{pm_market.market_id}:{kalshi_market.market_id}"
         validated = await validate_arbitrage_pair(
             polymarket,
             kalshi,
@@ -270,6 +315,8 @@ async def run_full_match_cycle(
             monitor_state.current_cycle,
             "full_match",
             logger,
+            pair_label,
+            paper,
         )
         if validated:
             verified, pm_exp, ks_exp = validated
@@ -295,6 +342,7 @@ async def run_tracking_cycle(
     logger: MonitorLogger,
     monitor_state: MonitorState,
     trade_amount: float,
+    paper: Optional[PaperEngine],
 ) -> Tuple[int, str]:
     print("   📡 执行价格追踪...")
     print(f"      追踪 {len(monitor_state.tracked_pairs)} 个匹配对")
@@ -341,6 +389,8 @@ async def run_tracking_cycle(
             monitor_state.current_cycle,
             "price_track",
             logger,
+            pair.pair_id,
+            paper,
         )
         if validated:
             verified, pm_exp, ks_exp = validated
@@ -372,6 +422,7 @@ async def run_cycle(
     arb_detector: ArbitrageDetector,
     logger: MonitorLogger,
     monitor_state: MonitorState,
+    paper: Optional[PaperEngine],
 ) -> CycleStats:
     start_time = datetime.now()
     print(
@@ -380,7 +431,14 @@ async def run_cycle(
 
     monitor_state.prune_tracked_beyond_resolution_horizon(datetime.now(timezone.utc))
 
-    trade_amount = 100.0
+    if paper is not None:
+        paper.tick_cooldowns()
+
+    await paper_cycle_start_close_checks(
+        polymarket, kalshi, paper, monitor_state.current_cycle
+    )
+
+    trade_amount = PAPER_PER_LEG_CAP_USDT
     is_full_match_cycle = monitor_state.should_full_match()
 
     if is_full_match_cycle and monitor_state.current_cycle > 0:
@@ -395,6 +453,7 @@ async def run_cycle(
             logger,
             monitor_state,
             trade_amount,
+            paper,
         )
         new_matches, opportunities = m, v
     else:
@@ -405,6 +464,7 @@ async def run_cycle(
             logger,
             monitor_state,
             trade_amount,
+            paper,
         )
         new_matches, opportunities = 0, c
 
@@ -458,6 +518,7 @@ async def main_async() -> None:
     matcher = MarketMatcher(matcher_config, category_mapper).with_logger(unclassified_logger)
     arb_detector = ArbitrageDetector(0.02)
     monitor_state = MonitorState(FULL_FETCH_INTERVAL, 10000)
+    paper_engine = PaperEngine.try_new()
 
     print("📡 首次获取市场并构建索引...")
 
@@ -465,6 +526,8 @@ async def main_async() -> None:
         kalshi_markets, polymarket_markets = await fetch_initial_markets(polymarket, kalshi)
     except Exception as e:
         print(f"❌ 首次获取市场失败: {e}")
+        if paper_engine is not None:
+            paper_engine.write_session_end("init_fetch_failed")
         return
 
     matcher.fit_vectorizer(kalshi_markets, polymarket_markets)
@@ -492,6 +555,7 @@ async def main_async() -> None:
                     arb_detector,
                     logger,
                     monitor_state,
+                    paper_engine,
                 )
                 print(
                     f"📊 周期统计: 新匹配 {stats.new_matches} 对, 套利 {stats.arbitrage_opportunities} 个, 追踪 {len(monitor_state.tracked_pairs)} 对"
@@ -504,6 +568,9 @@ async def main_async() -> None:
             await asyncio.sleep(30)
     except asyncio.CancelledError:
         print("\n🛑 监控已停止")
+    finally:
+        if paper_engine is not None:
+            paper_engine.write_session_end("shutdown")
 
 
 def main() -> None:

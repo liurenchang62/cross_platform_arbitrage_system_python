@@ -1,8 +1,8 @@
 # arbitrage_detector.py
-# 与 Rust `arbitrage_detector.rs` 对齐：100 USDT 探针、精确 n 份成本、Gas 两腿
+# 与参考实现对齐：100 USDT 探针、精确 n 份成本、Gas 两腿、双边 ask/bid 阶梯
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from market import MarketPrices
 
@@ -481,3 +481,100 @@ def parse_kalshi_orderbook(data: dict, side: str) -> Optional[List[Tuple[float, 
         return result
 
     return None
+
+
+# ==================== 卖出侧（bid 阶梯）用于模拟平仓 ====================
+
+
+@dataclass
+class PairOrderbookLadders:
+    pm_asks: List[Tuple[float, float]]
+    ks_asks: List[Tuple[float, float]]
+    pm_bids_desc: List[Tuple[float, float]]
+    ks_bids_desc: List[Tuple[float, float]]
+
+
+def parse_polymarket_bids_desc(data: dict, side: str) -> Optional[List[Tuple[float, float]]]:
+    _ = side
+    bids = data.get("bids", [])
+    if not isinstance(bids, list):
+        return None
+    result: List[Tuple[float, float]] = []
+    for bid in bids:
+        if not isinstance(bid, dict):
+            continue
+        price = _json_float(bid.get("price"))
+        size = _json_float(bid.get("size"))
+        if price > 0.0 and size > 0.0:
+            result.append((price, size))
+    if not result:
+        return None
+    result.sort(key=lambda x: x[0], reverse=True)
+    return result
+
+
+def parse_kalshi_bids_desc(data: dict, side: str) -> Optional[List[Tuple[float, float]]]:
+    orderbook = data.get("orderbook_fp")
+    if not isinstance(orderbook, dict):
+        return None
+    if side == "YES":
+        arr = orderbook.get("yes_dollars", [])
+    elif side == "NO":
+        arr = orderbook.get("no_dollars", [])
+    else:
+        return None
+    if not isinstance(arr, list):
+        return None
+    result: List[Tuple[float, float]] = []
+    for entry in arr:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        bid_price = _json_float(entry[0])
+        size = _json_float(entry[1])
+        if 0.01 < bid_price < 1.0 and size > 0.0:
+            result.append((bid_price, size))
+    if not result:
+        return None
+    result.sort(key=lambda x: x[0], reverse=True)
+    return result
+
+
+def build_pair_orderbook_ladders(
+    pm_book: Dict[str, Any],
+    ks_book: Dict[str, Any],
+    pm_side: str,
+    ks_side: str,
+) -> Optional[PairOrderbookLadders]:
+    pm_asks = parse_polymarket_orderbook(pm_book, pm_side)
+    ks_asks = parse_kalshi_orderbook(ks_book, ks_side)
+    pm_bids_desc = parse_polymarket_bids_desc(pm_book, pm_side)
+    ks_bids_desc = parse_kalshi_bids_desc(ks_book, ks_side)
+    if pm_asks is None or ks_asks is None or pm_bids_desc is None or ks_bids_desc is None:
+        return None
+    return PairOrderbookLadders(
+        pm_asks=pm_asks,
+        ks_asks=ks_asks,
+        pm_bids_desc=pm_bids_desc,
+        ks_bids_desc=ks_bids_desc,
+    )
+
+
+def proceeds_for_exact_contracts_sell(
+    bids_desc: List[Tuple[float, float]], n: float
+) -> Optional[Tuple[float, float]]:
+    if n <= 0.0 or not math.isfinite(n):
+        return None
+    eps = 1e-9
+    remaining = n
+    total_proceeds = 0.0
+    for price, size in bids_desc:
+        if remaining <= eps:
+            break
+        if size <= 0.0 or price <= 0.0:
+            continue
+        take = min(remaining, size)
+        total_proceeds += take * price
+        remaining -= take
+    if remaining > 1e-6:
+        return None
+    return (total_proceeds, total_proceeds / n)
