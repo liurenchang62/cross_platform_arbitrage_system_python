@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Set
 import numpy as np
 import snowballstemmer
 
-from query_params import MAX_VOCAB_SIZE
+from system_params import MAX_VOCAB_SIZE
 
 
 def get_stop_words() -> Set[str]:

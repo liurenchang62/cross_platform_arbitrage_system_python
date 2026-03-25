@@ -13,7 +13,7 @@ The end-to-end pipeline includes:
 - A **second-pass validation** stage (`validation.py`) that filters implausible pairings (cross-sport or structurally incompatible market types) before order-book analysis.
 - Optional **resolution-horizon filtering** so that only markets expected to resolve within a configured calendar window are considered (`market_filter.py`, parameters in `system_params.py`).
 - **Tracking** of pairs across monitor cycles, with periodic full rebuilds of the candidate set and incremental updates for pairs already under watch (`tracking.py`).
-- **Paper trading (optional)**: When enabled in `system_params.py`, `paper_trading.py` simulates cash, open positions per verified pair, per-cycle **early exit** on combined bid liquidity (with cooldown after closes), and append-only CSV under `logs/paper_trades.csv` (session markers, `OPEN`, `CLOSE`, `NO_CLOSE`).
+- **Paper trading (optional)**: When enabled in `system_params.py`, `paper_trading.py` simulates cash, open positions per verified pair, per-cycle **early exit** on combined bid liquidity (with cooldown after closes), and append-only CSV under `logs/paper_trades.csv` (session markers, `OPEN`, `CLOSE`, `NO_CLOSE`). The **`backtest`** package (`python -m backtest`) interactively summarizes that CSV by UTC session-start day, matching the reference workspace’s `backtest` crate.
 - **Structured logging**: daily monitor CSV files under `logs/`, plus optional capture of hard-to-classify markets under `logs/unclassified/`.
 
 Together, these pieces support continuous monitoring for situations where the same underlying proposition may be priced differently across venues, subject to the limitations described under **Disclaimer**.
@@ -23,7 +23,7 @@ Together, these pieces support continuous monitoring for situations where the sa
 ### Market data
 
 - Loads **open** markets from the **Polymarket Gamma API** and the **Kalshi Trade API**.
-- Pagination, per-request limits, and global caps are centralized in `system_params.py` (with `query_params.py` re-exporting the same names for compatibility) so you can tune how aggressively the monitor scans without changing core logic.
+- Pagination, per-request limits, and global caps are centralized in `system_params.py` so you can tune how aggressively the monitor scans without changing core logic.
 - Market records are normalized into internal structures (`market.py`) for consistent handling in matching and logging.
 
 ### Matching and classification
@@ -88,8 +88,10 @@ The scenario used for ranking and reporting (for example cycle **Top 10** and **
 - Install dependencies from `requirements.txt`:
   - **`aiohttp`** — asynchronous HTTP client for API calls.
   - **`numpy`** — numerical routines used in vector operations.
-  - **`snowballstemmer`** — English stemming for text tokenization.
-  - **`toml`** — parsing `config/categories.toml`.
+- **`snowballstemmer`** — English stemming for text tokenization.
+- **`toml`** — parsing `config/categories.toml`.
+- **`questionary`** — interactive selects for `python -m backtest`.
+- **`wcwidth`** — terminal column alignment for CJK in the backtest report (same layout intent as `unicode-width` in the reference tool).
 - Reliable **network access** to Polymarket and Kalshi public APIs. Endpoint URLs and rate limits may change; verify against current platform documentation if something stops working.
 
 ## Quick start
@@ -99,6 +101,14 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Paper backtest CLI
+
+```bash
+python -m backtest
+```
+
+Reads `logs/paper_trades.csv` by default, or the path in **`PAPER_TRADES_CSV`**. Interactive prompts follow the same UTC session-start rules and print the same boxed report as the reference `backtest` binary.
+
 Ensure **`config/categories.toml`** exists before the first run (a starter file is expected to live under `config/` in this repository).
 
 ## Configuration
@@ -107,12 +117,12 @@ Ensure **`config/categories.toml`** exists before the first run (a starter file 
 |------|---------|
 | `config/categories.toml` | Category names, weights, and keyword lists used for classification-aware matching. |
 | `system_params.py` | Request pacing, page sizes, fetch caps, **`SIMILARITY_THRESHOLD`**, **`SIMILARITY_TOP_K`**, **`FULL_FETCH_INTERVAL`**, **`RESOLUTION_HORIZON_DAYS`**, paper-trading toggles (`PAPER_TRADING_ENABLED`, `PAPER_PER_LEG_CAP_USDT`, …), and other global tuning constants. |
-| `query_params.py` | Re-exports `system_params` for backward-compatible imports. |
 
 ### Optional environment variables
 
 - **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted to a specific tag slug (see `clients.py`).
 - **`PAPER_RUN_LABEL`**: When paper logging is enabled, appended to CSV `notes` / session rows to tag test runs (see `system_params.PAPER_RUN_LABEL_ENV`).
+- **`PAPER_TRADES_CSV`**: Overrides the default path for the paper-trades file when running **`python -m backtest`** (see `system_params.PAPER_TRADES_CSV_ENV`).
 
 ## Repository layout
 
@@ -129,8 +139,9 @@ validation.py           Second-pass rule pipeline for candidate pairs
 market_filter.py        Resolution-horizon and related listing filters
 arbitrage_detector.py   Order-book traversal, fees, gas, and PnL helpers
 system_params.py        Shared tuning constants, API pacing, paper trading
-query_params.py         Re-export of system_params (compatibility)
 paper_trading.py        Optional simulated positions and trade log CSV
+backtest/               `python -m backtest` — paper CSV session performance CLI
+log_format.py           UTC/local time strings aligned with chrono CSV columns
 tracking.py             Per-cycle watch state for tracked pairs
 monitor_logger.py       Daily CSV monitor log writer
 cycle_statistics.py     Cycle-level statistical summaries

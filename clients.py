@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from market import Market, MarketPrices
-from query_params import *
+from system_params import *
 
 
 def _parse_rfc3339_field(market_data: dict, key: str) -> Optional[datetime]:

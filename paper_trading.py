@@ -19,6 +19,7 @@ from arbitrage_detector import (
     orderbook_best_ask_price,
     proceeds_for_exact_contracts_sell,
 )
+from log_format import utc_datetime_to_rfc3339
 from system_params import (
     PAPER_COOLDOWN_CYCLES,
     PAPER_INITIAL_CASH,
@@ -187,7 +188,7 @@ class PaperEngine:
             return
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+            w = csv.writer(f, lineterminator="\n")
             w.writerow(self.HEADER)
 
     def tick_cooldowns(self) -> None:
@@ -218,7 +219,7 @@ class PaperEngine:
             return
         Path(PAPER_TRADES_CSV).parent.mkdir(parents=True, exist_ok=True)
         with open(PAPER_TRADES_CSV, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(row)
+            csv.writer(f, lineterminator="\n").writerow(row)
 
     def check_early_close_at_cycle(
         self,
@@ -321,7 +322,7 @@ class PaperEngine:
                 pos.pair_label,
                 str(check_cycle),
                 pos.simulated_open_time_utc,
-                check_time.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00",
+                utc_datetime_to_rfc3339(check_time),
                 pos.pm_market_id,
                 pos.kalshi_market_id,
                 pos.pm_token_id,
@@ -370,7 +371,7 @@ class PaperEngine:
                 pos.pair_label,
                 str(check_cycle),
                 pos.simulated_open_time_utc,
-                check_time.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00",
+                utc_datetime_to_rfc3339(check_time),
                 pos.pm_market_id,
                 pos.kalshi_market_id,
                 pos.pm_token_id,
@@ -421,7 +422,7 @@ class PaperEngine:
             return False
 
         trade_id = str(uuid.uuid4())
-        open_time = opened_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"
+        open_time = utc_datetime_to_rfc3339(opened_at.astimezone(timezone.utc))
         pos = PaperPosition(
             trade_id=trade_id,
             pair_label=pair_label,
@@ -492,7 +493,7 @@ class PaperEngine:
 
     def _append_session_start(self) -> None:
         notes = (
-            f"marker=session_start wall_utc={self.session_wall_started.strftime('%Y-%m-%dT%H:%M:%S')}+00:00 "
+            f"marker=session_start wall_utc={utc_datetime_to_rfc3339(self.session_wall_started)} "
             f"initial_cash={self.initial_cash:.2f}"
         )
         self._write_session_marker_row(
@@ -510,7 +511,7 @@ class PaperEngine:
             return
         wall = datetime.now(timezone.utc)
         notes = (
-            f"marker=session_end wall_utc_end={wall.strftime('%Y-%m-%dT%H:%M:%S')}+00:00 "
+            f"marker=session_end wall_utc_end={utc_datetime_to_rfc3339(wall)} "
             f"last_cycle={self.max_cycle_seen} reason={reason}"
         )
         try:
@@ -539,10 +540,10 @@ class PaperEngine:
     ) -> None:
         if not self.write_trade_log:
             return
-        sim_str = simulated_wall.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"
+        sim_str = utc_datetime_to_rfc3339(simulated_wall)
         chk = ""
         if check_wall is not None:
-            chk = check_wall.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"
+            chk = utc_datetime_to_rfc3339(check_wall)
         self._append_row(
             [
                 event,

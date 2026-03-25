@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from market import Market
-from query_params import RESOLUTION_HORIZON_DAYS
+from system_params import RESOLUTION_HORIZON_DAYS
 
 
 def filter_markets_by_resolution_horizon(

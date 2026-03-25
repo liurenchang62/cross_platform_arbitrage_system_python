@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from arbitrage_detector import ArbitrageOpportunity
+from log_format import local_datetime_line, utc_datetime_to_rfc3339
 
 CSV_HEADER: List[str] = [
     "event_time_utc_rfc3339",
@@ -64,13 +65,7 @@ def _fmt_f64(x: float) -> str:
 def _utc_rfc3339(dt: Optional[datetime]) -> str:
     if dt is None:
         return ""
-    t = dt
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    else:
-        t = t.astimezone(timezone.utc)
-    s = t.isoformat(timespec="seconds")
-    return s.replace("+00:00", "Z")
+    return utc_datetime_to_rfc3339(dt)
 
 
 class MonitorLogger:
@@ -96,7 +91,7 @@ class MonitorLogger:
             need_header = (not os.path.exists(path)) or os.path.getsize(path) == 0
 
             with open(path, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
+                w = csv.writer(f, lineterminator="\n")
                 if need_header:
                     w.writerow(CSV_HEADER)
                 for row in rows:
@@ -119,14 +114,17 @@ class MonitorLogger:
         kalshi_resolution: Optional[datetime],
     ) -> None:
         at_utc = datetime.now(timezone.utc)
-        local_line = at_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        local_line = local_datetime_line(at_utc)
 
-        ob_pm = json.dumps([[p, s] for p, s in opp.orderbook_pm_top5])
-        ob_ks = json.dumps([[p, s] for p, s in opp.orderbook_kalshi_top5])
+        ob_pm = json.dumps(
+            [[p, s] for p, s in opp.orderbook_pm_top5], separators=(",", ":")
+        )
+        ob_ks = json.dumps(
+            [[p, s] for p, s in opp.orderbook_kalshi_top5], separators=(",", ":")
+        )
 
         r: List[str] = [""] * len(CSV_HEADER)
-        # 与 chrono `to_rfc3339` 类似：UTC，毫秒三位 + Z
-        r[0] = at_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        r[0] = utc_datetime_to_rfc3339(at_utc)
         r[1] = local_line
         r[2] = str(cycle_id)
         r[3] = cycle_phase

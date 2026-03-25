@@ -13,7 +13,7 @@ from category_mapper import CategoryMapper
 from category_vectorizer import CategoryVectorizer, CategoryVectorizerManager
 from text_vectorizer import TextVectorizer, VectorizerConfig
 from unclassified_logger import UnclassifiedLogger
-from query_params import SIMILARITY_THRESHOLD, SIMILARITY_TOP_K
+from system_params import SIMILARITY_THRESHOLD, SIMILARITY_TOP_K
 from validation import ValidationPipeline, MatchInfo
 
 

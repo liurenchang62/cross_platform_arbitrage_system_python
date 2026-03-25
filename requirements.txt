@@ -3,3 +3,5 @@ aiohttp>=3.9.0
 numpy>=1.24.0
 snowballstemmer>=2.2.0
 toml>=0.10.2
+questionary>=2.0.0
+wcwidth>=0.2.13

@@ -32,7 +32,7 @@ python main.py
 - `构建` / 索引与匹配进度输出  
 - `初筛匹配对`、`二筛过滤`  
 
-## 可调参数（`system_params.py`，`query_params.py` 为兼容重导出）
+## 可调参数（`system_params.py`）
 
 | 常量 | 含义 |
 |------|------|

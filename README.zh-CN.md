@@ -13,7 +13,7 @@
 - 在向量匹配之后，由 `validation.py` 执行**二筛校验流水线**，过滤跨领域或结构不兼容的伪匹配，再进入订单簿分析。
 - 通过 `market_filter.py`（参数见 `system_params.py`）按**预计解析日**做**时间窗口**筛选，使监控集中在特定期限内将结算的市场（若启用相关配置）。
 - 使用 `tracking.py` 在多次监控周期之间**持续追踪**已关注市场对，在「全量重建候选集」与「增量更新」之间按参数切换。
-- **模拟盘（可选）**：在 `system_params.py` 中开启后，由 `paper_trading.py` 维护虚拟资金与持仓，按周期在双边 **bid** 上评估提前平仓，冷却后再开仓，并可写入 `logs/paper_trades.csv`（`SESSION_*`、`OPEN`、`CLOSE`、`NO_CLOSE`）。
+- **模拟盘（可选）**：在 `system_params.py` 中开启后，由 `paper_trading.py` 维护虚拟资金与持仓，按周期在双边 **bid** 上评估提前平仓，冷却后再开仓，并可写入 `logs/paper_trades.csv`（`SESSION_*`、`OPEN`、`CLOSE`、`NO_CLOSE`）。**`backtest`** 包（`python -m backtest`）按 UTC 会话启动日交互式汇总该 CSV，与参考工作区中独立 crate **`backtest`** 一致。
 - 将结果写入结构化日志：按自然日划分的 `logs/` 下监控 CSV，以及可选的 `logs/unclassified/` 未分类样本记录。
 
 上述能力共同支持对「同一命题在不同场所定价是否一致」的持续观察；其实际意义与风险边界见文末**免责声明**。
@@ -23,7 +23,7 @@
 ### 市场数据
 
 - 从 **Polymarket Gamma API** 与 **Kalshi Trade API** 获取**开放**市场列表。
-- 分页大小、单次请求上限、全局拉取上限等集中在 `system_params.py`（`query_params.py` 为同名常量的兼容重导出），便于在不改核心逻辑的前提下调节扫描强度。
+- 分页大小、单次请求上限、全局拉取上限等集中在 `system_params.py`，便于在不改核心逻辑的前提下调节扫描强度。
 - 市场条目在 `market.py` 中归一化为统一结构，供匹配与日志模块使用。
 
 ### 匹配与分类
@@ -64,6 +64,14 @@
 - 由 **`PAPER_TRADING_ENABLED`**、**`PAPER_WRITE_TRADE_LOG`** 等开关控制（见 `system_params.py`）；单腿本金上限 **`PAPER_PER_LEG_CAP_USDT`** 与监控套利验证所用本金一致。
 - 可选环境变量 **`PAPER_RUN_LABEL`**（对应 `PAPER_RUN_LABEL_ENV`）用于在 CSV 的 `notes` 中标记测试轮次。
 
+### 模拟回测 CLI
+
+```bash
+python -m backtest
+```
+
+默认读取 `logs/paper_trades.csv`，或通过环境变量 **`PAPER_TRADES_CSV`** 指定路径（与参考实现中 `PAPER_TRADES_CSV` 一致）。交互流程与报表版式与参考 `backtest` 二进制对齐。
+
 ## 订单簿盈亏模型
 
 用于展示与排序的场景（例如周期 **Top 10**、**`net_profit_100`**）在代码中定义为：
@@ -90,6 +98,8 @@
   - **`numpy`**：向量与数值运算。
   - **`snowballstemmer`**：英文词干提取，服务文本向量化。
   - **`toml`**：解析 `config/categories.toml`。
+  - **`questionary`**：`python -m backtest` 的交互选项。
+  - **`wcwidth`**：回测报表在终端中的列宽（中文等宽字符），对应参考工具中的 `unicode-width`。
 - 需要能够稳定访问 Polymarket 与 Kalshi 的**公开 API**；若端点、鉴权或频控策略变更，请以平台最新文档为准并相应调整客户端代码或参数。
 
 ## 快速开始
@@ -107,12 +117,12 @@ python main.py
 |------|------|
 | `config/categories.toml` | 类别名称、权重与关键词列表，用于带类别约束的匹配。 |
 | `system_params.py` | 请求节奏、分页大小、拉取上限、**`SIMILARITY_THRESHOLD`**、**`SIMILARITY_TOP_K`**、**`FULL_FETCH_INTERVAL`**、**`RESOLUTION_HORIZON_DAYS`**、模拟盘相关常量等。 |
-| `query_params.py` | 对 `system_params` 的兼容重导出。 |
 
 ### 环境变量（可选）
 
 - **`POLYMARKET_TAG_SLUG`**：设置后，Polymarket 市场拉取可按指定 tag 过滤（实现见 `clients.py`）。
 - **`PAPER_RUN_LABEL`**：模拟盘写 CSV 时附加到 `notes`（见 `system_params.PAPER_RUN_LABEL_ENV`）。
+- **`PAPER_TRADES_CSV`**：`python -m backtest` 读取的模拟成交 CSV 路径（见 `system_params.PAPER_TRADES_CSV_ENV`）。
 
 ## 仓库结构
 
@@ -129,8 +139,9 @@ validation.py           候选对的二筛规则流水线
 market_filter.py        解析期限等列表过滤
 arbitrage_detector.py   订单簿遍历、手续费、Gas 与盈亏计算
 system_params.py        全局常量、API 节奏、模拟盘参数
-query_params.py         system_params 兼容重导出
 paper_trading.py        模拟持仓与 paper_trades.csv
+backtest/               python -m backtest，paper CSV 会话绩效 CLI
+log_format.py           与 chrono 一致的 UTC/本地时间字符串（CSV 列）
 tracking.py             周期内对已追踪对的维护
 monitor_logger.py       按日 CSV 监控日志
 cycle_statistics.py     周期统计汇总
