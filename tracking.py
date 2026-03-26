@@ -7,6 +7,18 @@ from market import Market, MarketPrices
 from market_filter import tracked_pair_exceeds_horizon
 
 
+def flip_binary_side(side: str) -> Optional[str]:
+    if side == "YES":
+        return "NO"
+    if side == "NO":
+        return "YES"
+    return None
+
+
+def oriented_track_id(pm_id: str, ks_id: str, pm_side: str, kalshi_side: str) -> str:
+    return f"{pm_id}:{ks_id}|{pm_side}|{kalshi_side}"
+
+
 @dataclass
 class TrackedArbitrage:
     """追踪的套利对"""
@@ -39,7 +51,12 @@ class TrackedArbitrage:
     ) -> 'TrackedArbitrage':
         """创建新的追踪套利对"""
         return cls(
-            pair_id=f"{pm_market.market_id}:{kalshi_market.market_id}",
+            pair_id=oriented_track_id(
+                pm_market.market_id,
+                kalshi_market.market_id,
+                pm_side,
+                kalshi_side,
+            ),
             pm_market=pm_market,
             kalshi_market=kalshi_market,
             similarity=similarity,
@@ -77,7 +94,9 @@ class MonitorState:
 
         # 添加新的匹配对
         for pm, kalshi, similarity, pm_side, kalshi_side, needs_inversion in new_matches:
-            pair_id = f"{pm.market_id}:{kalshi.market_id}"
+            pair_id = oriented_track_id(
+                pm.market_id, kalshi.market_id, pm_side, kalshi_side
+            )
             existing = next((p for p in self.tracked_pairs if p.pair_id == pair_id), None)
 
             if existing:

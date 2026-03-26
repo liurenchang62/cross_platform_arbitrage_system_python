@@ -386,8 +386,9 @@ class KalshiClient:
 
     KALSHI_DEFAULT_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-    def __init__(self):
-        self.base_url = self.KALSHI_DEFAULT_BASE
+    def __init__(self, base_url: Optional[str] = None):
+        u = (base_url or "").strip()
+        self.base_url = u if u else self.KALSHI_DEFAULT_BASE
         self.price_cache = PriceCache(60)
 
     async def request_with_retry(self, func, *args, **kwargs):

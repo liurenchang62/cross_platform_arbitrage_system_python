@@ -1,4 +1,5 @@
 # requirements.txt
+python-dotenv>=1.0.0
 aiohttp>=3.9.0
 numpy>=1.24.0
 snowballstemmer>=2.2.0

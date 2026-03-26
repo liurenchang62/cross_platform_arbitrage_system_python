@@ -76,6 +76,7 @@ class ArbitrageDetector:
         kalshi_side: str,
         needs_inversion: bool,
         capital_usdt: float,
+        pair_cap_usdt: float = 0.0,
     ) -> Optional[ArbitrageOpportunity]:
         """与 Rust `calculate_arbitrage_100usdt` 一致。"""
         total_cost_opt = pm_optimal + kalshi_optimal
@@ -126,6 +127,29 @@ class ArbitrageDetector:
             kalshi_avg = kalshi_optimal
 
         capital_used = c_pm + c_ks
+        if pair_cap_usdt > 0.0 and capital_used > pair_cap_usdt:
+            scale = pair_cap_usdt / capital_used
+            n *= scale
+            if n <= 0.0 or not math.isfinite(n):
+                return None
+            if pm_orderbook is not None:
+                cpm = cost_for_exact_contracts(pm_orderbook, n)
+                if cpm is None:
+                    return None
+                c_pm, pm_avg = cpm
+            else:
+                c_pm = n * pm_optimal
+                pm_avg = pm_optimal
+            if kalshi_orderbook is not None:
+                cks = cost_for_exact_contracts(kalshi_orderbook, n)
+                if cks is None:
+                    return None
+                c_ks, kalshi_avg = cks
+            else:
+                c_ks = n * kalshi_optimal
+                kalshi_avg = kalshi_optimal
+            capital_used = c_pm + c_ks
+
         gross = n * 1.0
         fees_amount = c_pm * self.fees.polymarket + c_ks * self.fees.kalshi
         gas_amount = GAS_FEE_PER_TX * 2.0

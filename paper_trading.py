@@ -21,9 +21,10 @@ from arbitrage_detector import (
 )
 from log_format import utc_datetime_to_rfc3339
 from system_params import (
+    CASH_UTILIZATION_MAX,
+    LOCAL_TOTAL_USD,
     PAPER_COOLDOWN_CYCLES,
     PAPER_INITIAL_CASH,
-    PAPER_MAX_OPEN_POSITIONS,
     PAPER_MIN_EDGE_EARLY_USD,
     PAPER_RUN_LABEL_ENV,
     PAPER_SESSION_COUNTER_FILE,
@@ -41,6 +42,7 @@ def validate_opportunity_from_ladders(
     kalshi_side: str,
     needs_inversion: bool,
     capital_usdt: float,
+    pair_cap_usdt: float,
 ) -> Optional[ArbitrageOpportunity]:
     pm_optimal = orderbook_best_ask_price(ladders.pm_asks)
     kalshi_optimal = orderbook_best_ask_price(ladders.ks_asks)
@@ -55,6 +57,7 @@ def validate_opportunity_from_ladders(
         kalshi_side,
         needs_inversion,
         capital_usdt,
+        pair_cap_usdt,
     )
 
 
@@ -396,6 +399,40 @@ class PaperEngine:
             ]
         )
 
+    def reset_to_pure_local_after_demo_failure(self, reason: str) -> None:
+        if self.write_trade_log and not self.session_end_logged:
+            self.write_session_end(reason)
+        self.session_end_logged = False
+
+        self.session_id = _next_session_id()
+        self.positions.clear()
+        self.cooldown_remaining.clear()
+        self.cash = float(LOCAL_TOTAL_USD)
+        self.initial_cash = float(LOCAL_TOTAL_USD)
+        self.max_cycle_seen = 0
+        self.session_wall_started = datetime.now(timezone.utc)
+
+        if self.write_trade_log:
+            self._ensure_csv_header()
+            notes = (
+                f"marker=session_start wall_utc={utc_datetime_to_rfc3339(self.session_wall_started)} "
+                f"initial_cash={self.initial_cash:.2f} local_fallback=1 prior_end_reason={reason}"
+            )
+            self._write_session_marker_row(
+                "SESSION_START",
+                0,
+                self.session_wall_started,
+                self.session_wall_started,
+                "",
+                "-",
+                notes,
+            )
+
+        print(
+            f"   📒 [Paper] 已切换为纯本地模拟新会话 | session_id={self.session_id} | "
+            f"初始资金 ${LOCAL_TOTAL_USD:.2f}（Kalshi Demo 下单已停止）"
+        )
+
     def try_open(
         self,
         pair_label: str,
@@ -407,13 +444,19 @@ class PaperEngine:
         kalshi_market_id: str,
         pm_token_id: str,
         opened_at: datetime,
+        kalshi_exec_notes: str = "",
     ) -> bool:
         if self.has_open(pair_label) or self.in_cooldown(pair_label):
             return False
-        if self.open_count() >= PAPER_MAX_OPEN_POSITIONS:
-            return False
 
         total_open_outlay = opp.capital_used + opp.fees_amount + opp.gas_amount
+        max_commit = self.cash * CASH_UTILIZATION_MAX
+        if total_open_outlay > max_commit:
+            print(
+                f"   📒 [Paper] 超过 {CASH_UTILIZATION_MAX * 100.0:.0f}% 可用现金上限，跳过开仓 {pair_label} | "
+                f"需要 ${total_open_outlay:.2f}（含费与 gas）| 当前现金 ${self.cash:.2f} 可动用至多 ${max_commit:.2f}"
+            )
+            return False
         if self.cash < total_open_outlay:
             print(
                 f"   📒 [Paper] 资金不足，跳过开仓 {pair_label} | "
@@ -444,11 +487,16 @@ class PaperEngine:
         self.cash -= total_open_outlay
         self.positions[pair_label] = pos
 
-        notes_parts = [f"open_session={self.session_id}"]
-        run_lbl = os.environ.get(PAPER_RUN_LABEL_ENV, "")
-        if run_lbl:
-            notes_parts.append(run_lbl)
-        notes = " ".join(notes_parts).strip()
+        run_lbl = os.environ.get(PAPER_RUN_LABEL_ENV, "").strip()
+        ks = kalshi_exec_notes.strip()
+        if not run_lbl and not ks:
+            notes = f"open_session={self.session_id}"
+        elif run_lbl and not ks:
+            notes = f"open_session={self.session_id} {run_lbl}"
+        elif not run_lbl and ks:
+            notes = f"open_session={self.session_id} {ks}"
+        else:
+            notes = f"open_session={self.session_id} {run_lbl} {ks}"
 
         if self.write_trade_log:
             self._bump_cycle(cycle)

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
@@ -17,12 +19,80 @@ from arbitrage_detector import (
     build_pair_orderbook_ladders,
 )
 from monitor_logger import MonitorLogger
-from tracking import MonitorState
-from system_params import FULL_FETCH_INTERVAL, PAPER_PER_LEG_CAP_USDT, SIMILARITY_THRESHOLD
+from tracking import MonitorState, flip_binary_side, oriented_track_id
+from system_params import (
+    DEMO_REFERENCE_BUDGET_USD,
+    FULL_FETCH_INTERVAL,
+    KALSHI_DEMO_API_KEY_ID_ENV,
+    KALSHI_DEMO_BASE_URL,
+    KALSHI_DEMO_PRIVATE_KEY_PATH_ENV,
+    LOCAL_TOTAL_USD,
+    SIMILARITY_THRESHOLD,
+    paper_caps_demo,
+    paper_caps_local,
+)
 from paper_trading import PaperEngine, validate_opportunity_from_ladders
 import cycle_statistics
 
 OpportunityRow = Tuple[ArbitrageOpportunity, str, str, Optional[datetime], Optional[datetime]]
+
+
+def _load_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+
+def _kalshi_demo_env_ok() -> bool:
+    return bool(
+        os.environ.get(KALSHI_DEMO_API_KEY_ID_ENV, "").strip()
+        and os.environ.get(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, "").strip()
+    )
+
+
+def print_kalshi_demo_not_configured_hint() -> None:
+    has_id = bool(os.environ.get(KALSHI_DEMO_API_KEY_ID_ENV, "").strip())
+    has_path = bool(os.environ.get(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, "").strip())
+    print("   📘 Kalshi Demo 未启用：本进程未加载到可用凭证（将全部记 ks_exec=local）。")
+    if not has_id and not has_path:
+        print(
+            f"      → 需要同时设置 {KALSHI_DEMO_API_KEY_ID_ENV} 与 {KALSHI_DEMO_PRIVATE_KEY_PATH_ENV}"
+        )
+        print("      → 环境变量与项目是否在「同一盘符」无关；须在**运行 python 的终端/IDE**里可见。")
+        print("      → 若在「系统环境变量」里修改过，请**关掉并重新打开**终端或 Cursor 再运行。")
+        print("      → 可在项目根目录放 `.env`（已 gitignore 的常见做法），程序启动时会尝试自动加载。")
+    else:
+        if not has_id:
+            print(f"      → 缺少或为空: {KALSHI_DEMO_API_KEY_ID_ENV}")
+        if not has_path:
+            print(f"      → 缺少或为空: {KALSHI_DEMO_PRIVATE_KEY_PATH_ENV}")
+
+
+def expand_dual_orientations(
+    matches: List[Tuple[Market, Market, float, str, str, bool]],
+) -> List[Tuple[Market, Market, float, str, str, bool]]:
+    """同一 PM–Kalshi 匹配在验证器给出的腿向上，再增加「两侧同时取反」的另一腿（与 Rust `expand_dual_orientations` 对齐）。"""
+    out: List[Tuple[Market, Market, float, str, str, bool]] = []
+    seen: set[Tuple[str, str, str, str]] = set()
+
+    for pm, ks, sim, pms, kss, inv in matches:
+
+        def try_push(ps: str, ks_: str) -> None:
+            key = (pm.market_id, ks.market_id, ps, ks_)
+            if key not in seen:
+                seen.add(key)
+                out.append((deepcopy(pm), deepcopy(ks), sim, ps, ks_, inv))
+
+        try_push(pms, kss)
+        fa = flip_binary_side(pms)
+        fb = flip_binary_side(kss)
+        if fa is not None and fb is not None:
+            try_push(fa, fb)
+
+    return out
 
 
 def format_resolution_expiry(label: str, dt: Optional[datetime]) -> str:
@@ -56,11 +126,13 @@ async def validate_arbitrage_pair(
     kalshi_side: str,
     needs_inversion: bool,
     capital_usdt: float,
+    pair_cap_usdt: float,
     cycle_id: int,
     cycle_phase: str,
     logger: MonitorLogger,
     pair_label: str,
     paper: Optional[PaperEngine],
+    kalshi_exec_notes: str = "ks_exec=local",
 ) -> Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime]]]:
     if not pm_market.token_ids:
         return None
@@ -81,6 +153,7 @@ async def validate_arbitrage_pair(
         kalshi_side,
         needs_inversion,
         capital_usdt,
+        pair_cap_usdt,
     )
     if opp is None:
         return None
@@ -127,7 +200,7 @@ async def validate_arbitrage_pair(
         f"     📉 滑点后均价:   PM {opp.pm_avg_slipped:.4f} ({pm_slip:+.2f}%)  |  Kalshi {opp.kalshi_avg_slipped:.4f} ({ks_slip:+.2f}%)"
     )
     print("     ─────────────────────────────────────────────────────────")
-    print(f"     💰 投入 {int(capital_usdt)} USDT 利润拆解:")
+    print(f"     💰 投入 ${capital_usdt:.2f}（每腿探针上限）利润拆解:")
     print(f"        毛利润(兑付): ${opp.contracts:.2f}")
     print(f"        - 成本:        ${opp.capital_used:.2f}")
     print(f"        - 手续费:      ${opp.fees_amount:.2f}")
@@ -167,6 +240,7 @@ async def validate_arbitrage_pair(
                 kalshi_market.market_id,
                 tid,
                 datetime.now(timezone.utc),
+                kalshi_exec_notes,
             )
         except Exception as e:
             print(f"   ⚠️ [Paper] try_open 失败: {e}")
@@ -212,7 +286,9 @@ async def paper_cycle_start_close_checks(
         )
 
 
-def format_top10_opportunities(opportunities: List[OpportunityRow]) -> str:
+def format_top10_opportunities(
+    opportunities: List[OpportunityRow], mode_caption: str
+) -> str:
     lines: List[str] = []
     lines.append("")
     if not opportunities:
@@ -220,9 +296,10 @@ def format_top10_opportunities(opportunities: List[OpportunityRow]) -> str:
         return "\n".join(lines) + "\n"
 
     sorted_rows = sorted(opportunities, key=lambda r: r[0].net_profit_100, reverse=True)
-    lines.append("╔══════════════════════════════════════════════════════════════════════╗")
-    lines.append("║  🏆 本周期利润 Top 10（100 USDT 本金，含滑点/手续费/Gas）                 ║")
-    lines.append("╚══════════════════════════════════════════════════════════════════════╝")
+    lines.append(f"🏆 本周期利润 Top 10（{mode_caption}，含滑点/手续费/Gas）")
+    lines.append(
+        "──────────────────────────────────────────────────────────────────────"
+    )
 
     for i, (opp, pm_title, kalshi_title, pm_dt, ks_dt) in enumerate(sorted_rows[:10]):
         pm_slip = (
@@ -267,7 +344,9 @@ async def run_full_match_cycle(
     logger: MonitorLogger,
     monitor_state: MonitorState,
     trade_amount: float,
+    pair_cap_usdt: float,
     paper: Optional[PaperEngine],
+    top10_mode_caption: str,
 ) -> Tuple[int, int, str, str]:
     print("   📡 执行全量匹配...")
 
@@ -287,8 +366,14 @@ async def run_full_match_cycle(
     matcher.build_polymarket_index(polymarket_markets)
 
     print("   🔍 匹配市场...")
-    matches = await matcher.find_matches_bidirectional(polymarket_markets, kalshi_markets)
-    print(f"      ✅ 找到 {len(matches)} 个匹配对")
+    raw_matches = await matcher.find_matches_bidirectional(
+        polymarket_markets, kalshi_markets
+    )
+    base_pairs = len(raw_matches)
+    matches = expand_dual_orientations(raw_matches)
+    print(
+        f"      ✅ 基础匹配 {base_pairs} 对，展开双向腿后 {len(matches)} 条追踪配置"
+    )
 
     all_matches: List[Tuple[Market, Market, float, str, str, bool]] = []
     for pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion in matches:
@@ -300,7 +385,12 @@ async def run_full_match_cycle(
     opportunities: List[OpportunityRow] = []
 
     for pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion in matches:
-        pair_label = f"{pm_market.market_id}:{kalshi_market.market_id}"
+        pair_label = oriented_track_id(
+            pm_market.market_id,
+            kalshi_market.market_id,
+            pm_side,
+            kalshi_side,
+        )
         validated = await validate_arbitrage_pair(
             polymarket,
             kalshi,
@@ -312,6 +402,7 @@ async def run_full_match_cycle(
             kalshi_side,
             needs_inversion,
             trade_amount,
+            pair_cap_usdt,
             monitor_state.current_cycle,
             "full_match",
             logger,
@@ -326,7 +417,7 @@ async def run_full_match_cycle(
                 (verified, pm_market.title, kalshi_market.title, pm_exp, ks_exp)
             )
 
-    top10_block = format_top10_opportunities(opportunities)
+    top10_block = format_top10_opportunities(opportunities, top10_mode_caption)
     print(top10_block, end="")
     full_cycle_block = cycle_statistics.on_full_cycle_completed(opportunities)
 
@@ -342,7 +433,9 @@ async def run_tracking_cycle(
     logger: MonitorLogger,
     monitor_state: MonitorState,
     trade_amount: float,
+    pair_cap_usdt: float,
     paper: Optional[PaperEngine],
+    top10_mode_caption: str,
 ) -> Tuple[int, str]:
     print("   📡 执行价格追踪...")
     print(f"      追踪 {len(monitor_state.tracked_pairs)} 个匹配对")
@@ -386,6 +479,7 @@ async def run_tracking_cycle(
             pair.kalshi_side,
             pair.needs_inversion,
             trade_amount,
+            pair_cap_usdt,
             monitor_state.current_cycle,
             "price_track",
             logger,
@@ -403,7 +497,7 @@ async def run_tracking_cycle(
                 (verified, pair.pm_market.title, pair.kalshi_market.title, pm_exp, ks_exp)
             )
 
-    top10_block = format_top10_opportunities(opportunities)
+    top10_block = format_top10_opportunities(opportunities, top10_mode_caption)
     print(top10_block, end="")
 
     return opportunity_count, top10_block
@@ -438,7 +532,16 @@ async def run_cycle(
         polymarket, kalshi, paper, monitor_state.current_cycle
     )
 
-    trade_amount = PAPER_PER_LEG_CAP_USDT
+    demo_keys = _kalshi_demo_env_ok()
+    per_leg_cap, pair_cap = (
+        paper_caps_demo() if demo_keys else paper_caps_local()
+    )
+    trade_amount = per_leg_cap
+    top10_caption = (
+        f"demo · 参考盘子 ${int(DEMO_REFERENCE_BUDGET_USD)} · 每腿 ${per_leg_cap:.2f} · 每对 ${pair_cap:.2f}"
+        if demo_keys
+        else f"local · 纸面 ${int(LOCAL_TOTAL_USD)} · 每腿 ${per_leg_cap:.2f} · 每对 ${pair_cap:.2f}"
+    )
     is_full_match_cycle = monitor_state.should_full_match()
 
     if is_full_match_cycle and monitor_state.current_cycle > 0:
@@ -453,7 +556,9 @@ async def run_cycle(
             logger,
             monitor_state,
             trade_amount,
+            pair_cap,
             paper,
+            top10_caption,
         )
         new_matches, opportunities = m, v
     else:
@@ -464,7 +569,9 @@ async def run_cycle(
             logger,
             monitor_state,
             trade_amount,
+            pair_cap,
             paper,
+            top10_caption,
         )
         new_matches, opportunities = 0, c
 
@@ -495,6 +602,8 @@ async def fetch_initial_markets(
 
 
 async def main_async() -> None:
+    _load_dotenv()
+
     print("🚀 启动跨平台套利监控系统")
     print("📊 监控平台: Polymarket ↔ Kalshi")
 
@@ -505,7 +614,24 @@ async def main_async() -> None:
     category_mapper = CategoryMapper.from_file("config/categories.toml")
 
     polymarket = PolymarketClient()
-    kalshi = KalshiClient()
+    demo_keys = _kalshi_demo_env_ok()
+    if demo_keys:
+        print("   📗 Kalshi 市场与订单簿使用 Demo API（与 Demo 下单 ticker 一致）")
+        kalshi = KalshiClient(KALSHI_DEMO_BASE_URL)
+        pl, pp = paper_caps_demo()
+        print("   📗 Kalshi Demo 凭证已加载：IOC 限价单走官方 Demo API（Python 监控路径暂不发起 IOC）")
+        print(
+            f"   📗 标尺 [demo]：策略参考总盘子 ${int(DEMO_REFERENCE_BUDGET_USD)} | "
+            f"每腿探针 ${pl:.2f} | 每对名义上限 ${pp:.2f}"
+        )
+    else:
+        print_kalshi_demo_not_configured_hint()
+        kalshi = KalshiClient()
+        pl, pp = paper_caps_local()
+        print(
+            f"   📒 标尺 [local]：纸面总资金 ${int(LOCAL_TOTAL_USD)} | "
+            f"每腿探针 ${pl:.2f} | 每对名义上限 ${pp:.2f}"
+        )
 
     matcher_config = MarketMatcherConfig(
         similarity_threshold=SIMILARITY_THRESHOLD,

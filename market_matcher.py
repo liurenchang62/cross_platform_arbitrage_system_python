@@ -12,7 +12,7 @@ from market import Market
 from category_mapper import CategoryMapper
 from category_vectorizer import CategoryVectorizer, CategoryVectorizerManager
 from text_vectorizer import TextVectorizer, VectorizerConfig
-from unclassified_logger import UnclassifiedLogger
+from unclassified_logger import UnclassifiedLogger, log_unclassified_market
 from system_params import SIMILARITY_THRESHOLD, SIMILARITY_TOP_K
 from validation import ValidationPipeline, MatchInfo
 
@@ -149,10 +149,7 @@ class MarketMatcher:
 
             if not categories:
                 if self.unclassified_logger:
-                    try:
-                        self.unclassified_logger.log_unclassified(market)
-                    except Exception as e:
-                        print(f"   ⚠️ 记录未分类市场失败: {e}")
+                    log_unclassified_market(self.unclassified_logger, market)
                 if "unclassified" not in by_category:
                     by_category["unclassified"] = []
                 by_category["unclassified"].append((market_id, market.title, data))
@@ -189,10 +186,7 @@ class MarketMatcher:
 
             if not categories:
                 if self.unclassified_logger:
-                    try:
-                        self.unclassified_logger.log_unclassified(market)
-                    except Exception as e:
-                        print(f"   ⚠️ 记录未分类市场失败: {e}")
+                    log_unclassified_market(self.unclassified_logger, market)
                 if "unclassified" not in by_category:
                     by_category["unclassified"] = []
                 by_category["unclassified"].append((market_id, market.title, data))

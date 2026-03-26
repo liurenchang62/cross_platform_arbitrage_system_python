@@ -9,11 +9,17 @@ RETRY_INITIAL_DELAY_MS = 1000
 
 # ==================== Polymarket 参数 ====================
 POLYMARKET_PAGE_LIMIT = 200
-POLYMARKET_MAX_MARKETS = 50000
+POLYMARKET_MAX_MARKETS = 30000
 
 # ==================== Kalshi 参数 ====================
 KALSHI_PAGE_LIMIT = 1000
-KALSHI_MAX_MARKETS = 50000
+KALSHI_MAX_MARKETS = 30000
+
+KALSHI_DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
+
+KALSHI_DEMO_API_KEY_ID_ENV = "KALSHI_DEMO_API_KEY_ID"
+
+KALSHI_DEMO_PRIVATE_KEY_PATH_ENV = "KALSHI_DEMO_PRIVATE_KEY_PATH"
 
 # ==================== 向量化参数 ====================
 MAX_VOCAB_SIZE = None
@@ -34,10 +40,36 @@ PAPER_SESSION_COUNTER_FILE = "logs/paper_session_counter.txt"
 PAPER_TRADES_CSV = "logs/paper_trades.csv"
 # 回测 CLI 读取路径的环境变量名（与 `backtest` crate 一致）
 PAPER_TRADES_CSV_ENV = "PAPER_TRADES_CSV"
-PAPER_PER_LEG_CAP_USDT = 100.0
+
+CASH_UTILIZATION_MAX = 0.95
+
+DEMO_REFERENCE_BUDGET_USD = 500.0
+
+LOCAL_TOTAL_USD = 10_000.0
+
+PAIR_CAP_FRAC_OF_REFERENCE = 0.04
+
+PER_LEG_CAP_FRAC_OF_REFERENCE = 0.02
+
+
+def paper_caps_demo() -> tuple[float, float]:
+    r = DEMO_REFERENCE_BUDGET_USD
+    return (
+        r * PER_LEG_CAP_FRAC_OF_REFERENCE,
+        r * PAIR_CAP_FRAC_OF_REFERENCE,
+    )
+
+
+def paper_caps_local() -> tuple[float, float]:
+    r = LOCAL_TOTAL_USD
+    return (
+        r * PER_LEG_CAP_FRAC_OF_REFERENCE,
+        r * PAIR_CAP_FRAC_OF_REFERENCE,
+    )
+
+
 PAPER_COOLDOWN_CYCLES = 5
-PAPER_INITIAL_CASH = 100_000.0
-PAPER_MAX_OPEN_POSITIONS = 50
+PAPER_INITIAL_CASH = LOCAL_TOTAL_USD
 PAPER_MIN_EDGE_EARLY_USD = 0.5
 
 
