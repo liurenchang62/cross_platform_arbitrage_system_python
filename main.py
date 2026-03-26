@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
+
+import aiohttp
 
 from market import Market
 from market_filter import filter_markets_by_resolution_horizon
@@ -20,6 +23,7 @@ from arbitrage_detector import (
 )
 from monitor_logger import MonitorLogger
 from tracking import MonitorState, flip_binary_side, oriented_track_id
+from kalshi_demo import KalshiDemoConfig, KalshiDemoConfigError, place_demo_buy_ioc
 from system_params import (
     DEMO_REFERENCE_BUDGET_USD,
     FULL_FETCH_INTERVAL,
@@ -27,6 +31,8 @@ from system_params import (
     KALSHI_DEMO_BASE_URL,
     KALSHI_DEMO_PRIVATE_KEY_PATH_ENV,
     LOCAL_TOTAL_USD,
+    MAX_RETRIES,
+    RETRY_INITIAL_DELAY_MS,
     SIMILARITY_THRESHOLD,
     paper_caps_demo,
     paper_caps_local,
@@ -44,13 +50,6 @@ def _load_dotenv() -> None:
         load_dotenv()
     except ImportError:
         pass
-
-
-def _kalshi_demo_env_ok() -> bool:
-    return bool(
-        os.environ.get(KALSHI_DEMO_API_KEY_ID_ENV, "").strip()
-        and os.environ.get(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, "").strip()
-    )
 
 
 def print_kalshi_demo_not_configured_hint() -> None:
@@ -132,7 +131,9 @@ async def validate_arbitrage_pair(
     logger: MonitorLogger,
     pair_label: str,
     paper: Optional[PaperEngine],
-    kalshi_exec_notes: str = "ks_exec=local",
+    demo_http: Optional[aiohttp.ClientSession],
+    kalshi_demo_cfg: Optional[KalshiDemoConfig],
+    demo_trading_active: List[bool],
 ) -> Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime]]]:
     if not pm_market.token_ids:
         return None
@@ -229,6 +230,52 @@ async def validate_arbitrage_pair(
         print(f"         ⚠️ 写入监控 CSV 失败: {e}")
 
     if paper is not None:
+        ks_exec_notes = "ks_exec=local"
+        if (
+            demo_trading_active[0]
+            and kalshi_demo_cfg is not None
+            and demo_http is not None
+        ):
+            placed: Optional[Tuple[str, str]] = None
+            last_err: Optional[str] = None
+            for attempt in range(MAX_RETRIES):
+                client_order_id = str(uuid.uuid4())
+                try:
+                    order_id = await place_demo_buy_ioc(
+                        demo_http,
+                        kalshi_demo_cfg,
+                        kalshi_market.market_id,
+                        kalshi_side,
+                        opp,
+                        client_order_id,
+                        capital_usdt,
+                    )
+                    placed = (order_id, client_order_id)
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    print(
+                        f"   ⚠️ [Kalshi Demo] 下单失败 (尝试 {attempt + 1}/{MAX_RETRIES}): {e}"
+                    )
+                    if attempt + 1 < MAX_RETRIES:
+                        wait_ms = RETRY_INITIAL_DELAY_MS * (attempt + 1)
+                        await asyncio.sleep(wait_ms / 1000.0)
+            if placed is not None:
+                oid, cid = placed
+                ks_exec_notes = (
+                    f"ks_exec=demo kalshi_order_id={oid} kalshi_client_order_id={cid}"
+                )
+                print(
+                    f"   📗 [Kalshi Demo] 已提交 IOC 限价买单 order_id={oid} ticker={kalshi_market.market_id}"
+                )
+            else:
+                print(
+                    f"   ❌ [Kalshi Demo] 重试耗尽，停止 Demo 下单；纸面切换为纯本地新会话。最后错误: {last_err!r}"
+                )
+                demo_trading_active[0] = False
+                paper.reset_to_pure_local_after_demo_failure(
+                    f"kalshi_demo_order_failed_after_retries {last_err or ''}"
+                )
         try:
             paper.try_open(
                 pair_label,
@@ -240,7 +287,7 @@ async def validate_arbitrage_pair(
                 kalshi_market.market_id,
                 tid,
                 datetime.now(timezone.utc),
-                kalshi_exec_notes,
+                ks_exec_notes,
             )
         except Exception as e:
             print(f"   ⚠️ [Paper] try_open 失败: {e}")
@@ -347,6 +394,9 @@ async def run_full_match_cycle(
     pair_cap_usdt: float,
     paper: Optional[PaperEngine],
     top10_mode_caption: str,
+    demo_http: Optional[aiohttp.ClientSession],
+    kalshi_demo_cfg: Optional[KalshiDemoConfig],
+    demo_trading_active: List[bool],
 ) -> Tuple[int, int, str, str]:
     print("   📡 执行全量匹配...")
 
@@ -408,6 +458,9 @@ async def run_full_match_cycle(
             logger,
             pair_label,
             paper,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
         )
         if validated:
             verified, pm_exp, ks_exp = validated
@@ -436,6 +489,9 @@ async def run_tracking_cycle(
     pair_cap_usdt: float,
     paper: Optional[PaperEngine],
     top10_mode_caption: str,
+    demo_http: Optional[aiohttp.ClientSession],
+    kalshi_demo_cfg: Optional[KalshiDemoConfig],
+    demo_trading_active: List[bool],
 ) -> Tuple[int, str]:
     print("   📡 执行价格追踪...")
     print(f"      追踪 {len(monitor_state.tracked_pairs)} 个匹配对")
@@ -485,6 +541,9 @@ async def run_tracking_cycle(
             logger,
             pair.pair_id,
             paper,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
         )
         if validated:
             verified, pm_exp, ks_exp = validated
@@ -517,6 +576,9 @@ async def run_cycle(
     logger: MonitorLogger,
     monitor_state: MonitorState,
     paper: Optional[PaperEngine],
+    demo_http: Optional[aiohttp.ClientSession],
+    kalshi_demo_cfg: Optional[KalshiDemoConfig],
+    demo_trading_active: List[bool],
 ) -> CycleStats:
     start_time = datetime.now()
     print(
@@ -532,14 +594,14 @@ async def run_cycle(
         polymarket, kalshi, paper, monitor_state.current_cycle
     )
 
-    demo_keys = _kalshi_demo_env_ok()
+    use_demo_caps = demo_trading_active[0] and kalshi_demo_cfg is not None
     per_leg_cap, pair_cap = (
-        paper_caps_demo() if demo_keys else paper_caps_local()
+        paper_caps_demo() if use_demo_caps else paper_caps_local()
     )
     trade_amount = per_leg_cap
     top10_caption = (
         f"demo · 参考盘子 ${int(DEMO_REFERENCE_BUDGET_USD)} · 每腿 ${per_leg_cap:.2f} · 每对 ${pair_cap:.2f}"
-        if demo_keys
+        if use_demo_caps
         else f"local · 纸面 ${int(LOCAL_TOTAL_USD)} · 每腿 ${per_leg_cap:.2f} · 每对 ${pair_cap:.2f}"
     )
     is_full_match_cycle = monitor_state.should_full_match()
@@ -559,6 +621,9 @@ async def run_cycle(
             pair_cap,
             paper,
             top10_caption,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
         )
         new_matches, opportunities = m, v
     else:
@@ -572,6 +637,9 @@ async def run_cycle(
             pair_cap,
             paper,
             top10_caption,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
         )
         new_matches, opportunities = 0, c
 
@@ -604,6 +672,14 @@ async def fetch_initial_markets(
 async def main_async() -> None:
     _load_dotenv()
 
+    try:
+        kalshi_demo_cfg = KalshiDemoConfig.try_from_env()
+    except KalshiDemoConfigError as e:
+        print(f"❌ Kalshi Demo 配置错误: {e}")
+        return
+
+    demo_trading_active = [kalshi_demo_cfg is not None]
+
     print("🚀 启动跨平台套利监控系统")
     print("📊 监控平台: Polymarket ↔ Kalshi")
 
@@ -614,12 +690,11 @@ async def main_async() -> None:
     category_mapper = CategoryMapper.from_file("config/categories.toml")
 
     polymarket = PolymarketClient()
-    demo_keys = _kalshi_demo_env_ok()
-    if demo_keys:
+    if kalshi_demo_cfg is not None:
         print("   📗 Kalshi 市场与订单簿使用 Demo API（与 Demo 下单 ticker 一致）")
         kalshi = KalshiClient(KALSHI_DEMO_BASE_URL)
         pl, pp = paper_caps_demo()
-        print("   📗 Kalshi Demo 凭证已加载：IOC 限价单走官方 Demo API（Python 监控路径暂不发起 IOC）")
+        print("   📗 Kalshi Demo 凭证已加载：IOC 限价单走官方 Demo API")
         print(
             f"   📗 标尺 [demo]：策略参考总盘子 ${int(DEMO_REFERENCE_BUDGET_USD)} | "
             f"每腿探针 ${pl:.2f} | 每对名义上限 ${pp:.2f}"
@@ -646,57 +721,64 @@ async def main_async() -> None:
     monitor_state = MonitorState(FULL_FETCH_INTERVAL, 10000)
     paper_engine = PaperEngine.try_new()
 
-    print("📡 首次获取市场并构建索引...")
+    timeout = aiohttp.ClientTimeout(total=25)
+    async with aiohttp.ClientSession(timeout=timeout) as demo_http:
+        print("📡 首次获取市场并构建索引...")
 
-    try:
-        kalshi_markets, polymarket_markets = await fetch_initial_markets(polymarket, kalshi)
-    except Exception as e:
-        print(f"❌ 首次获取市场失败: {e}")
-        if paper_engine is not None:
-            paper_engine.write_session_end("init_fetch_failed")
-        return
+        try:
+            kalshi_markets, polymarket_markets = await fetch_initial_markets(
+                polymarket, kalshi
+            )
+        except Exception as e:
+            print(f"❌ 首次获取市场失败: {e}")
+            if paper_engine is not None:
+                paper_engine.write_session_end("init_fetch_failed")
+            return
 
-    matcher.fit_vectorizer(kalshi_markets, polymarket_markets)
+        matcher.fit_vectorizer(kalshi_markets, polymarket_markets)
 
-    print("🌲 构建 Kalshi 市场索引...")
-    matcher.build_kalshi_index(kalshi_markets)
+        print("🌲 构建 Kalshi 市场索引...")
+        matcher.build_kalshi_index(kalshi_markets)
 
-    print("🌲 构建 Polymarket 市场索引...")
-    matcher.build_polymarket_index(polymarket_markets)
+        print("🌲 构建 Polymarket 市场索引...")
+        matcher.build_polymarket_index(polymarket_markets)
 
-    print("\n✅ 初始化完成")
-    print(f"   📊 Kalshi 市场数: {len(kalshi_markets)}")
-    print(f"   📊 Polymarket 市场数: {len(polymarket_markets)}")
-    print(f"   📊 Kalshi 索引大小: {matcher.kalshi_index_size()}")
-    print(f"   📊 Polymarket 索引大小: {matcher.polymarket_index_size()}")
-    print("\n🔄 开始监控循环 (间隔: 30秒)...\n")
+        print("\n✅ 初始化完成")
+        print(f"   📊 Kalshi 市场数: {len(kalshi_markets)}")
+        print(f"   📊 Polymarket 市场数: {len(polymarket_markets)}")
+        print(f"   📊 Kalshi 索引大小: {matcher.kalshi_index_size()}")
+        print(f"   📊 Polymarket 索引大小: {matcher.polymarket_index_size()}")
+        print("\n🔄 开始监控循环 (间隔: 30秒)...\n")
 
-    try:
-        while True:
-            try:
-                stats = await run_cycle(
-                    polymarket,
-                    kalshi,
-                    matcher,
-                    arb_detector,
-                    logger,
-                    monitor_state,
-                    paper_engine,
-                )
-                print(
-                    f"📊 周期统计: 新匹配 {stats.new_matches} 对, 套利 {stats.arbitrage_opportunities} 个, 追踪 {len(monitor_state.tracked_pairs)} 对"
-                )
-            except Exception as e:
-                print(f"❌ 周期错误: {e}")
+        try:
+            while True:
+                try:
+                    stats = await run_cycle(
+                        polymarket,
+                        kalshi,
+                        matcher,
+                        arb_detector,
+                        logger,
+                        monitor_state,
+                        paper_engine,
+                        demo_http,
+                        kalshi_demo_cfg,
+                        demo_trading_active,
+                    )
+                    print(
+                        f"📊 周期统计: 新匹配 {stats.new_matches} 对, 套利 {stats.arbitrage_opportunities} 个, 追踪 {len(monitor_state.tracked_pairs)} 对"
+                    )
+                except Exception as e:
+                    print(f"❌ 周期错误: {e}")
 
-            monitor_state.next_cycle()
-            print("⏳ 等待下一周期...\n")
-            await asyncio.sleep(30)
-    except asyncio.CancelledError:
-        print("\n🛑 监控已停止")
-    finally:
-        if paper_engine is not None:
-            paper_engine.write_session_end("shutdown")
+                monitor_state.next_cycle()
+                print("⏳ 等待下一周期...\n")
+                await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            print("\n🛑 监控已停止")
+        finally:
+            if paper_engine is not None:
+                paper_engine.write_session_end("shutdown")
 
 
 def main() -> None:

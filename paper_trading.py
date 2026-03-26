@@ -22,6 +22,8 @@ from arbitrage_detector import (
 from log_format import utc_datetime_to_rfc3339
 from system_params import (
     CASH_UTILIZATION_MAX,
+    KALSHI_DEMO_API_KEY_ID_ENV,
+    KALSHI_DEMO_PRIVATE_KEY_PATH_ENV,
     LOCAL_TOTAL_USD,
     PAPER_COOLDOWN_CYCLES,
     PAPER_INITIAL_CASH,
@@ -540,9 +542,13 @@ class PaperEngine:
         return True
 
     def _append_session_start(self) -> None:
+        demo_cfg = bool(os.environ.get(KALSHI_DEMO_API_KEY_ID_ENV, "").strip()) and bool(
+            os.environ.get(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, "").strip()
+        )
+        demo_tag = " kalshi_demo_keys_configured=1" if demo_cfg else ""
         notes = (
             f"marker=session_start wall_utc={utc_datetime_to_rfc3339(self.session_wall_started)} "
-            f"initial_cash={self.initial_cash:.2f}"
+            f"initial_cash={self.initial_cash:.2f}{demo_tag}"
         )
         self._write_session_marker_row(
             "SESSION_START",
