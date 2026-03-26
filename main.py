@@ -6,6 +6,7 @@ import os
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import aiohttp
@@ -44,10 +45,12 @@ OpportunityRow = Tuple[ArbitrageOpportunity, str, str, Optional[datetime], Optio
 
 
 def _load_dotenv() -> None:
+    """从本仓库根目录加载 `.env`（与 `main.py` 同目录），不依赖进程当前工作目录。"""
     try:
         from dotenv import load_dotenv
 
-        load_dotenv()
+        env_path = Path(__file__).resolve().parent / ".env"
+        load_dotenv(env_path)
     except ImportError:
         pass
 
