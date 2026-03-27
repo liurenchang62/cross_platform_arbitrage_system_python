@@ -1,8 +1,7 @@
-# main.py — 与参考监控主程序行为/输出对齐
+# main.py — Polymarket ↔ Kalshi 跨平台监控与套利验证入口
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -30,6 +29,7 @@ from system_params import (
     FULL_FETCH_INTERVAL,
     KALSHI_DEMO_API_KEY_ID_ENV,
     KALSHI_DEMO_BASE_URL,
+    KALSHI_DEMO_MODE_ENABLED,
     KALSHI_DEMO_PRIVATE_KEY_PATH_ENV,
     LOCAL_TOTAL_USD,
     MAX_RETRIES,
@@ -55,28 +55,18 @@ def _load_dotenv() -> None:
         pass
 
 
-def print_kalshi_demo_not_configured_hint() -> None:
-    has_id = bool(os.environ.get(KALSHI_DEMO_API_KEY_ID_ENV, "").strip())
-    has_path = bool(os.environ.get(KALSHI_DEMO_PRIVATE_KEY_PATH_ENV, "").strip())
-    print("   📘 Kalshi Demo 未启用：本进程未加载到可用凭证（将全部记 ks_exec=local）。")
-    if not has_id and not has_path:
-        print(
-            f"      → 需要同时设置 {KALSHI_DEMO_API_KEY_ID_ENV} 与 {KALSHI_DEMO_PRIVATE_KEY_PATH_ENV}"
-        )
-        print("      → 环境变量与项目是否在「同一盘符」无关；须在**运行 python 的终端/IDE**里可见。")
-        print("      → 若在「系统环境变量」里修改过，请**关掉并重新打开**终端或 Cursor 再运行。")
-        print("      → 可在项目根目录放 `.env`（已 gitignore 的常见做法），程序启动时会尝试自动加载。")
-    else:
-        if not has_id:
-            print(f"      → 缺少或为空: {KALSHI_DEMO_API_KEY_ID_ENV}")
-        if not has_path:
-            print(f"      → 缺少或为空: {KALSHI_DEMO_PRIVATE_KEY_PATH_ENV}")
+def print_kalshi_demo_mode_missing_credentials() -> None:
+    print(
+        f"❌ system_params.KALSHI_DEMO_MODE_ENABLED=True，但未配置 "
+        f"{KALSHI_DEMO_API_KEY_ID_ENV} 与 {KALSHI_DEMO_PRIVATE_KEY_PATH_ENV}"
+    )
+    print("   请在运行进程的环境中同时设置上述变量（可使用项目根目录 `.env`，启动时会自动加载）。")
 
 
 def expand_dual_orientations(
     matches: List[Tuple[Market, Market, float, str, str, bool]],
 ) -> List[Tuple[Market, Market, float, str, str, bool]]:
-    """同一 PM–Kalshi 匹配在验证器给出的腿向上，再增加「两侧同时取反」的另一腿（与 Rust `expand_dual_orientations` 对齐）。"""
+    """同一 PM–Kalshi 匹配在验证器给出的腿向上，再增加「两侧同时取反」的另一腿，去重后用于追踪与验证。"""
     out: List[Tuple[Market, Market, float, str, str, bool]] = []
     seen: set[Tuple[str, str, str, str]] = set()
 
@@ -129,6 +119,7 @@ async def validate_arbitrage_pair(
     needs_inversion: bool,
     capital_usdt: float,
     pair_cap_usdt: float,
+    per_leg_cap_usd: float,
     cycle_id: int,
     cycle_phase: str,
     logger: MonitorLogger,
@@ -251,7 +242,7 @@ async def validate_arbitrage_pair(
                         kalshi_side,
                         opp,
                         client_order_id,
-                        capital_usdt,
+                        per_leg_cap_usd,
                     )
                     placed = (order_id, client_order_id)
                     break
@@ -386,37 +377,30 @@ def format_top10_opportunities(
     return "\n".join(lines)
 
 
-async def run_full_match_cycle(
+async def run_full_match_work(
     polymarket: PolymarketClient,
     kalshi: KalshiClient,
     matcher: MarketMatcher,
     arb_detector: ArbitrageDetector,
     logger: MonitorLogger,
     monitor_state: MonitorState,
+    polymarket_markets: List[Market],
+    kalshi_markets: List[Market],
     trade_amount: float,
     pair_cap_usdt: float,
+    per_leg_cap_usd: float,
     paper: Optional[PaperEngine],
     top10_mode_caption: str,
     demo_http: Optional[aiohttp.ClientSession],
     kalshi_demo_cfg: Optional[KalshiDemoConfig],
     demo_trading_active: List[bool],
+    rebuild_index: bool,
 ) -> Tuple[int, int, str, str]:
-    print("   📡 执行全量匹配...")
-
-    polymarket_raw = await polymarket.fetch_all_markets()
-    kalshi_raw = await kalshi.fetch_all_markets()
-    now = datetime.now(timezone.utc)
-    polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now)
-    kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now)
-
-    print(
-        f"      Polymarket: {len(polymarket_markets)} 个市场 (21d 窗口内), Kalshi: {len(kalshi_markets)} 个市场 (21d 窗口内)"
-    )
-
-    print("\n   🔄 重建索引...")
-    matcher.fit_vectorizer(kalshi_markets, polymarket_markets)
-    matcher.build_kalshi_index(kalshi_markets)
-    matcher.build_polymarket_index(polymarket_markets)
+    if rebuild_index:
+        print("\n   🔄 重建索引...")
+        matcher.fit_vectorizer(kalshi_markets, polymarket_markets)
+        matcher.build_kalshi_index(kalshi_markets)
+        matcher.build_polymarket_index(polymarket_markets)
 
     print("   🔍 匹配市场...")
     raw_matches = await matcher.find_matches_bidirectional(
@@ -456,6 +440,7 @@ async def run_full_match_cycle(
             needs_inversion,
             trade_amount,
             pair_cap_usdt,
+            per_leg_cap_usd,
             monitor_state.current_cycle,
             "full_match",
             logger,
@@ -482,6 +467,55 @@ async def run_full_match_cycle(
     return len(matches), verified_count, top10_block, full_cycle_block
 
 
+async def run_full_match_cycle(
+    polymarket: PolymarketClient,
+    kalshi: KalshiClient,
+    matcher: MarketMatcher,
+    arb_detector: ArbitrageDetector,
+    logger: MonitorLogger,
+    monitor_state: MonitorState,
+    trade_amount: float,
+    pair_cap_usdt: float,
+    per_leg_cap_usd: float,
+    paper: Optional[PaperEngine],
+    top10_mode_caption: str,
+    demo_http: Optional[aiohttp.ClientSession],
+    kalshi_demo_cfg: Optional[KalshiDemoConfig],
+    demo_trading_active: List[bool],
+) -> Tuple[int, int, str, str]:
+    print("   📡 执行全量匹配（拉取最新市场并重建索引）...")
+
+    polymarket_raw = await polymarket.fetch_all_markets()
+    kalshi_raw = await kalshi.fetch_all_markets()
+    now = datetime.now(timezone.utc)
+    polymarket_markets = filter_markets_by_resolution_horizon(polymarket_raw, now)
+    kalshi_markets = filter_markets_by_resolution_horizon(kalshi_raw, now)
+
+    print(
+        f"      Polymarket: {len(polymarket_markets)} 个市场 (21d 窗口内), Kalshi: {len(kalshi_markets)} 个市场 (21d 窗口内)"
+    )
+
+    return await run_full_match_work(
+        polymarket,
+        kalshi,
+        matcher,
+        arb_detector,
+        logger,
+        monitor_state,
+        polymarket_markets,
+        kalshi_markets,
+        trade_amount,
+        pair_cap_usdt,
+        per_leg_cap_usd,
+        paper,
+        top10_mode_caption,
+        demo_http,
+        kalshi_demo_cfg,
+        demo_trading_active,
+        True,
+    )
+
+
 async def run_tracking_cycle(
     polymarket: PolymarketClient,
     kalshi: KalshiClient,
@@ -490,6 +524,7 @@ async def run_tracking_cycle(
     monitor_state: MonitorState,
     trade_amount: float,
     pair_cap_usdt: float,
+    per_leg_cap_usd: float,
     paper: Optional[PaperEngine],
     top10_mode_caption: str,
     demo_http: Optional[aiohttp.ClientSession],
@@ -539,6 +574,7 @@ async def run_tracking_cycle(
             pair.needs_inversion,
             trade_amount,
             pair_cap_usdt,
+            per_leg_cap_usd,
             monitor_state.current_cycle,
             "price_track",
             logger,
@@ -602,8 +638,9 @@ async def run_cycle(
         paper_caps_demo() if use_demo_caps else paper_caps_local()
     )
     trade_amount = per_leg_cap
+    per_leg_cap_usd = per_leg_cap
     top10_caption = (
-        f"demo · 参考盘子 ${int(DEMO_REFERENCE_BUDGET_USD)} · 每腿 ${per_leg_cap:.2f} · 每对 ${pair_cap:.2f}"
+        f"demo · 标尺 ${int(DEMO_REFERENCE_BUDGET_USD)} · 每腿 ${per_leg_cap:.2f} · 每对 ${pair_cap:.2f}"
         if use_demo_caps
         else f"local · 纸面 ${int(LOCAL_TOTAL_USD)} · 每腿 ${per_leg_cap:.2f} · 每对 ${pair_cap:.2f}"
     )
@@ -622,6 +659,7 @@ async def run_cycle(
             monitor_state,
             trade_amount,
             pair_cap,
+            per_leg_cap_usd,
             paper,
             top10_caption,
             demo_http,
@@ -638,6 +676,7 @@ async def run_cycle(
             monitor_state,
             trade_amount,
             pair_cap,
+            per_leg_cap_usd,
             paper,
             top10_caption,
             demo_http,
@@ -675,13 +714,21 @@ async def fetch_initial_markets(
 async def main_async() -> None:
     _load_dotenv()
 
-    try:
-        kalshi_demo_cfg = KalshiDemoConfig.try_from_env()
-    except KalshiDemoConfigError as e:
-        print(f"❌ Kalshi Demo 配置错误: {e}")
-        return
+    kalshi_demo_cfg: Optional[KalshiDemoConfig] = None
+    demo_trading_active: List[bool]
 
-    demo_trading_active = [kalshi_demo_cfg is not None]
+    if KALSHI_DEMO_MODE_ENABLED:
+        try:
+            kalshi_demo_cfg = KalshiDemoConfig.try_from_env()
+        except KalshiDemoConfigError as e:
+            print(f"❌ Kalshi Demo 配置错误: {e}")
+            return
+        if kalshi_demo_cfg is None:
+            print_kalshi_demo_mode_missing_credentials()
+            return
+        demo_trading_active = [True]
+    else:
+        demo_trading_active = [False]
 
     print("🚀 启动跨平台套利监控系统")
     print("📊 监控平台: Polymarket ↔ Kalshi")
@@ -694,16 +741,18 @@ async def main_async() -> None:
 
     polymarket = PolymarketClient()
     if kalshi_demo_cfg is not None:
-        print("   📗 Kalshi 市场与订单簿使用 Demo API（与 Demo 下单 ticker 一致）")
+        print("   📗 Kalshi Demo 已开启（system_params）：市场/订单簿使用 Demo API")
         kalshi = KalshiClient(KALSHI_DEMO_BASE_URL)
         pl, pp = paper_caps_demo()
         print("   📗 Kalshi Demo 凭证已加载：IOC 限价单走官方 Demo API")
         print(
-            f"   📗 标尺 [demo]：策略参考总盘子 ${int(DEMO_REFERENCE_BUDGET_USD)} | "
+            f"   📗 标尺 [demo]：策略总盘子 ${int(DEMO_REFERENCE_BUDGET_USD)} | "
             f"每腿探针 ${pl:.2f} | 每对名义上限 ${pp:.2f}"
         )
     else:
-        print_kalshi_demo_not_configured_hint()
+        print(
+            "   📒 Kalshi Demo 已关闭（system_params.KALSHI_DEMO_MODE_ENABLED=False），使用生产 Trade API"
+        )
         kalshi = KalshiClient()
         pl, pp = paper_caps_local()
         print(
@@ -746,11 +795,48 @@ async def main_async() -> None:
         print("🌲 构建 Polymarket 市场索引...")
         matcher.build_polymarket_index(polymarket_markets)
 
-        print("\n✅ 初始化完成")
+        print(
+            "\n🔍 初始化 · 全量匹配（周期 #0，沿用本次拉取与索引，不重复请求、不重训）..."
+        )
+        use_demo_caps = demo_trading_active[0] and kalshi_demo_cfg is not None
+        per_leg_cap0, pair_cap0 = (
+            paper_caps_demo() if use_demo_caps else paper_caps_local()
+        )
+        top10_caption_init = (
+            f"demo · 标尺 ${int(DEMO_REFERENCE_BUDGET_USD)} · 每腿 ${per_leg_cap0:.2f} · 每对 ${pair_cap0:.2f}"
+            if use_demo_caps
+            else f"local · 纸面 ${int(LOCAL_TOTAL_USD)} · 每腿 ${per_leg_cap0:.2f} · 每对 ${pair_cap0:.2f}"
+        )
+        await run_full_match_work(
+            polymarket,
+            kalshi,
+            matcher,
+            arb_detector,
+            logger,
+            monitor_state,
+            polymarket_markets,
+            kalshi_markets,
+            per_leg_cap0,
+            pair_cap0,
+            per_leg_cap0,
+            paper_engine,
+            top10_caption_init,
+            demo_http,
+            kalshi_demo_cfg,
+            demo_trading_active,
+            False,
+        )
+
+        print("\n✅ 初始化完成（全量匹配已作为周期 #0 完成）")
         print(f"   📊 Kalshi 市场数: {len(kalshi_markets)}")
         print(f"   📊 Polymarket 市场数: {len(polymarket_markets)}")
         print(f"   📊 Kalshi 索引大小: {matcher.kalshi_index_size()}")
         print(f"   📊 Polymarket 索引大小: {matcher.polymarket_index_size()}")
+        print(
+            f"   📌 监控从周期 #1 起为价格追踪；下一全量重建约在周期 #{FULL_FETCH_INTERVAL}"
+        )
+        monitor_state.next_cycle()
+
         print("\n🔄 开始监控循环 (间隔: 30秒)...\n")
 
         try:

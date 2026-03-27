@@ -1,5 +1,5 @@
 # category_vectorizer.py
-#! 类别独立的向量化器管理（与 Rust `category_vectorizer.rs` 对齐：并行 fit_all / with_fitted_vectorizer / insert_built_category）
+# 类别独立的向量化器管理：并行 fit、按类建索引、回写字典。
 
 from __future__ import annotations
 
@@ -116,7 +116,7 @@ class CategoryVectorizerManager:
             self.vectorizers[category] = cv
 
     def fit_all(self, markets_by_category: Dict[str, List[str]]) -> None:
-        """并行拟合所有类别（与 Rust `rayon` 语义对齐）。"""
+        """并行拟合所有类别。"""
         total = len(markets_by_category)
         if total == 0:
             return

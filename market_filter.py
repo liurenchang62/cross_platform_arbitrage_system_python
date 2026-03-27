@@ -1,4 +1,4 @@
-# market_filter.py — 与 Rust `market_filter.rs` 对齐
+# market_filter.py — 解析日时间窗与其它列表过滤
 """按解析日筛选市场：剔除「有明确解析时间且晚于 horizon」的远期市场；无解析日期的保留。"""
 
 from datetime import datetime, timedelta, timezone

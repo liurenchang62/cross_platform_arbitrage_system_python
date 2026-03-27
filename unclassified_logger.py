@@ -1,5 +1,5 @@
 # unclassified_logger.py
-#! 未分类日志模块：记录没有匹配到任何类别的市场（与参考实现 CSV 行格式一致）
+# 未分类日志：记录未能归入配置类别的市场（CSV 行格式与监控日志分列一致）。
 from __future__ import annotations
 
 import os
@@ -27,7 +27,7 @@ def _trim_non_alphanumeric_edges(word: str) -> str:
 
 
 def analyze_recent_logs(days: int) -> List[Tuple[str, int]]:
-    """分析最近 N 天的未分类日志，统计关键词频次（与 Rust `UnclassifiedLogger::analyze_recent_logs` 对齐）。"""
+    """分析最近 N 天的未分类日志，统计关键词频次。"""
     log_dir = _analyze_log_dir
     if not log_dir.is_dir():
         return []

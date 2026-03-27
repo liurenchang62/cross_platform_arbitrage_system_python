@@ -1,12 +1,12 @@
 # log_format.py
-# 时间与 CSV 相关格式，与 chrono `DateTime::to_rfc3339`（秒精度、UTC 用 Z）及本地时间行对齐。
+# 时间与监视 CSV 列：RFC3339 秒精度、UTC 用 Z；本地时间列单独格式化。
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 
 def utc_datetime_to_rfc3339(dt: datetime) -> str:
-    """UTC 时刻格式化为 RFC3339，与 Rust `chrono::DateTime<Utc>::to_rfc3339()` 默认秒精度一致（末尾 Z）。"""
+    """UTC 时刻格式化为 RFC3339 秒精度（末尾 Z）。"""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     else:

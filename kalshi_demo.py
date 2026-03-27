@@ -1,5 +1,5 @@
 # kalshi_demo.py
-# Kalshi Demo：RSA-PSS-SHA256 签名与 POST /portfolio/orders 限价 IOC 下单（与 Rust `kalshi_demo.rs` 对齐）。
+# Kalshi Demo：RSA-PSS-SHA256 签名与 POST /portfolio/orders 限价 IOC 下单。
 from __future__ import annotations
 
 import base64

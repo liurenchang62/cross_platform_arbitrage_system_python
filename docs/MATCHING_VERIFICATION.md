@@ -1,6 +1,6 @@
 # 匹配管线验证说明（精确余弦索引）
 
-与 Rust 参考实现一致；本文件描述 Python 版行为。
+本文档描述本仓库内市场匹配、二筛与日志行为。
 
 ## 索引检索
 
@@ -41,5 +41,6 @@ python main.py
 
 ---
 
-Python 版使用 `numpy` 做点积检索，与 Rust `ndarray` 矩阵乘法语义对齐。  
-文本向量化与 Rust 一致：`snowballstemmer`（English）词干、`ceil(max_df_ratio * n_docs)` 的文档频率上限、与 Rust 相同的分词边界（保留 `-`、按非标点切分）。
+类内检索使用 `numpy` 做点积（L2 归一化 TF-IDF 下即精确余弦）。  
+全库阶段：`market_matcher.py` 先按**大类**用矩阵块乘（`MATCH_MATMUL_CHUNK_ROWS`）做 PM↔Kalshi 初筛，再统一跑 `validation` 二筛流水线。  
+文本向量化：`snowballstemmer`（English）词干、`ceil(max_df_ratio * n_docs)` 的文档频率上限、分词边界保留 `-`、在非字母数字处切分。

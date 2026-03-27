@@ -13,7 +13,7 @@ The end-to-end pipeline includes:
 - A **second-pass validation** stage (`validation.py`) that filters implausible pairings (cross-sport or structurally incompatible market types) before order-book analysis.
 - Optional **resolution-horizon filtering** so that only markets expected to resolve within a configured calendar window are considered (`market_filter.py`, parameters in `system_params.py`).
 - **Tracking** of pairs across monitor cycles, with periodic full rebuilds of the candidate set and incremental updates for pairs already under watch (`tracking.py`).
-- **Paper trading (optional)**: When enabled in `system_params.py`, `paper_trading.py` simulates cash, open positions per verified pair, per-cycle **early exit** on combined bid liquidity (with cooldown after closes), and append-only CSV under `logs/paper_trades.csv` (session markers, `OPEN`, `CLOSE`, `NO_CLOSE`). The **`backtest`** package (`python -m backtest`) interactively summarizes that CSV by UTC session-start day, matching the reference workspace’s `backtest` crate.
+- **Paper trading (optional)**: When enabled in `system_params.py`, `paper_trading.py` simulates cash, open positions per verified pair, per-cycle **early exit** on combined bid liquidity (with cooldown after closes), and append-only CSV under `logs/paper_trades.csv` (session markers, `OPEN`, `CLOSE`, `NO_CLOSE`). The **`backtest`** package (`python -m backtest`) interactively summarizes that CSV by UTC session-start day.
 - **Structured logging**: daily monitor CSV files under `logs/`, plus optional capture of hard-to-classify markets under `logs/unclassified/`.
 
 Together, these pieces support continuous monitoring for situations where the same underlying proposition may be priced differently across venues, subject to the limitations described under **Disclaimer**.
@@ -29,7 +29,7 @@ Together, these pieces support continuous monitoring for situations where the sa
 ### Matching and classification
 
 - **Vectorization**: English-oriented tokenization and stemming (via `snowballstemmer` in `text_vectorizer.py`) produce sparse vectors comparable in spirit to classic TF-IDF weighting.
-- **Indexing and search**: `vector_index.py` supports efficient similarity queries; `market_matcher.py` orchestrates building indices per venue, cross-querying, and applying **top‑K** and **similarity threshold** cuts from `system_params.py`.
+- **Indexing and search**: `vector_index.py` supports exact cosine-style queries per category; `market_matcher.py` fits per-category vectorizers, builds both venue indices, runs a **class-level matrix prescreen** (batched GEMM, chunk size `MATCH_MATMUL_CHUNK_ROWS`), then a unified second-pass pipeline in `validation.py`, and applies **top‑K** plus **similarity threshold** from `system_params.py`.
 - **Categories**: `config/categories.toml` supplies category labels, keyword hints, and weights. `category_mapper.py` and `category_vectorizer.py` integrate category signals with text similarity so that matches are both numerically close and semantically plausible.
 
 ### Second-pass validation
@@ -46,6 +46,10 @@ Together, these pieces support continuous monitoring for situations where the sa
 - For each **validated** pair that passes similarity and business rules, the program requests **current** order books on both venues and parses **ask-side liquidity** into ascending price ladders.
 - It then computes a **notional-capped, depth-walked** buy scenario on each leg, derives a **common hedged size**, and reports **capital used**, **fees**, **assumed gas**, and **`net_profit_100`** (see **Order-book PnL model** below).
 - Implementation lives in `arbitrage_detector.py` and is invoked from `main.py` (`validate_arbitrage_pair` and related helpers).
+
+### Startup and cycle numbering
+
+- After the first market fetch and index build, the program runs **one full match pass as cycle #0** using the same snapshots and vectors (**no second fetch, no refit**). It then advances the cycle counter so **cycle #1 onward** are primarily **price-tracking** passes; periodic **full rebuilds** still occur every `FULL_FETCH_INTERVAL` cycles (full fetch + refit + match).
 
 ### Tracking across cycles
 
@@ -72,7 +76,7 @@ The scenario used for ranking and reporting (for example cycle **Top 10** and **
    For each matched pair that survives validation, the program requests the **current** Polymarket and Kalshi **order books** over HTTP and parses resting **sell-side** liquidity into **ascending ask ladders** `(price, size)`.
 
 2. **Per-leg notional cap**  
-   Each leg is allocated a maximum spend of **100 USDT** (`PAPER_PER_LEG_CAP_USDT` in `system_params.py`, assigned in `main.py` as `trade_amount`). The ladder is traversed **level by level** until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `arbitrage_detector.py`), yielding a **fillable contract count** per venue for that cap.
+   Each leg uses the monitor’s configured **per-leg USD cap** (`paper_caps_demo()` or `paper_caps_local()` from `system_params.py`, passed as `trade_amount` in `main.py`). The ladder is traversed **level by level** until that cap is reached or liquidity is exhausted (`calculate_slippage_with_fixed_usdt` in `arbitrage_detector.py`), yielding a **fillable contract count** per venue for that cap. Optional Kalshi Demo IOC orders use the same **per-leg cap** parameter separately from order-book sizing.
 
 3. **Hedged size**  
    The scenario size **n** is the **minimum** of the two per-leg contract counts so that both legs can be notionally filled at the **same** number of contracts.
@@ -80,7 +84,7 @@ The scenario used for ranking and reporting (for example cycle **Top 10** and **
 4. **Cost and profit at size n**  
    For exactly **n** contracts, per-leg total cost and **volume-weighted average prices** are recomputed by walking each ladder again (`cost_for_exact_contracts`). Combined legs yield **`capital_used`**. Platform fees and a **fixed gas assumption** are subtracted to obtain **`net_profit_100`**. A row is treated as an actionable opportunity when **`net_profit_100`** exceeds the detector’s configured minimum; this gate is applied to the **depth-based** result, not to a single price level in isolation.
 
-**Implementation reference**: `validate_arbitrage_pair` in `main.py`; `calculate_arbitrage_100usdt`, `calculate_slippage_with_fixed_usdt`, and `cost_for_exact_contracts` in `arbitrage_detector.py`.
+**Primary entry points**: `validate_arbitrage_pair` in `main.py`; `calculate_arbitrage_100usdt`, `calculate_slippage_with_fixed_usdt`, and `cost_for_exact_contracts` in `arbitrage_detector.py`.
 
 ## Requirements
 
@@ -91,7 +95,7 @@ The scenario used for ranking and reporting (for example cycle **Top 10** and **
 - **`snowballstemmer`** — English stemming for text tokenization.
 - **`toml`** — parsing `config/categories.toml`.
 - **`questionary`** — interactive selects for `python -m backtest`.
-- **`wcwidth`** — terminal column alignment for CJK in the backtest report (same layout intent as `unicode-width` in the reference tool).
+- **`wcwidth`** — terminal column alignment for CJK in the backtest report.
 - Reliable **network access** to Polymarket and Kalshi public APIs. Endpoint URLs and rate limits may change; verify against current platform documentation if something stops working.
 
 ## Quick start
@@ -107,7 +111,7 @@ python main.py
 python -m backtest
 ```
 
-Reads `logs/paper_trades.csv` by default, or the path in **`PAPER_TRADES_CSV`**. Interactive prompts follow the same UTC session-start rules and print the same boxed report as the reference `backtest` binary.
+Reads `logs/paper_trades.csv` by default, or the path in **`PAPER_TRADES_CSV`**. Interactive prompts follow UTC session-start rules and print a boxed session summary.
 
 Ensure **`config/categories.toml`** exists before the first run (a starter file is expected to live under `config/` in this repository).
 
@@ -116,13 +120,16 @@ Ensure **`config/categories.toml`** exists before the first run (a starter file 
 | Path | Purpose |
 |------|---------|
 | `config/categories.toml` | Category names, weights, and keyword lists used for classification-aware matching. |
-| `system_params.py` | Request pacing, page sizes, fetch caps, **`SIMILARITY_THRESHOLD`**, **`SIMILARITY_TOP_K`**, **`FULL_FETCH_INTERVAL`**, **`RESOLUTION_HORIZON_DAYS`**, paper-trading toggles (`PAPER_TRADING_ENABLED`, `PAPER_PER_LEG_CAP_USDT`, …), and other global tuning constants. |
+| `system_params.py` | Request pacing, page sizes, fetch caps, **`KALSHI_DEMO_MODE_ENABLED`**, **`SIMILARITY_THRESHOLD`**, **`MATCH_MATMUL_CHUNK_ROWS`**, **`FULL_FETCH_INTERVAL`**, **`RESOLUTION_HORIZON_DAYS`**, paper-trading toggles, demo/local budget caps, and other global tuning constants. |
 
 ### Optional environment variables
 
 - **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted to a specific tag slug (see `clients.py`).
+- **`KALSHI_DEMO_API_KEY_ID`** / **`KALSHI_DEMO_PRIVATE_KEY_PATH`**: Required when **`KALSHI_DEMO_MODE_ENABLED`** is `True` in `system_params.py` (RSA private key PEM for Demo API signing).
 - **`PAPER_RUN_LABEL`**: When paper logging is enabled, appended to CSV `notes` / session rows to tag test runs (see `system_params.PAPER_RUN_LABEL_ENV`).
 - **`PAPER_TRADES_CSV`**: Overrides the default path for the paper-trades file when running **`python -m backtest`** (see `system_params.PAPER_TRADES_CSV_ENV`).
+
+`python-dotenv` is optional: if installed, `main.py` loads **`.env`** from the repository root next to `main.py`.
 
 ## Repository layout
 
@@ -141,7 +148,7 @@ arbitrage_detector.py   Order-book traversal, fees, gas, and PnL helpers
 system_params.py        Shared tuning constants, API pacing, paper trading
 paper_trading.py        Optional simulated positions and trade log CSV
 backtest/               `python -m backtest` — paper CSV session performance CLI
-log_format.py           UTC/local time strings aligned with chrono CSV columns
+log_format.py           UTC/local time strings for CSV columns
 tracking.py             Per-cycle watch state for tracked pairs
 monitor_logger.py       Daily CSV monitor log writer
 cycle_statistics.py     Cycle-level statistical summaries

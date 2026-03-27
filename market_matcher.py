@@ -1,5 +1,5 @@
 # market_matcher.py
-#! 市场匹配器：TF-IDF（L2 归一化）+ 按类精确余弦 Top-K 候选生成，再经二筛（与 Rust `market_matcher.rs` 对齐）
+# 市场匹配器：按类别堆叠 TF-IDF（L2 归一化）向量矩阵，用 P·Kᵀ / K·Pᵀ 做初筛与 Top-K，再统一二筛。
 
 import asyncio
 import copy
@@ -8,19 +8,22 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import numpy as np
+
 from market import Market
 from category_mapper import CategoryMapper
 from category_vectorizer import CategoryVectorizer, CategoryVectorizerManager
 from text_vectorizer import TextVectorizer, VectorizerConfig
 from unclassified_logger import UnclassifiedLogger, log_unclassified_market
-from system_params import SIMILARITY_THRESHOLD, SIMILARITY_TOP_K
-from validation import ValidationPipeline, MatchInfo
+from system_params import MATCH_MATMUL_CHUNK_ROWS, SIMILARITY_THRESHOLD, SIMILARITY_TOP_K
+from validation import ValidationPipeline
+from vector_index import IndexItem
 
 
 def _parallel_build_category_worker(
     task: Tuple[str, List[Tuple[str, str, Optional[Any]]], TextVectorizer],
 ) -> Tuple[str, CategoryVectorizer]:
-    """供 `parallel_build_category_indices` 线程池使用（与 Rust rayon 任务等价）。"""
+    """供 `parallel_build_category_indices` 线程池使用的 worker。"""
     category, items, vz = task
     cv = CategoryVectorizer.with_fitted_vectorizer(category, vz)
     cv.add_markets_batch(items)
@@ -107,11 +110,11 @@ class MarketMatcher:
         manager: CategoryVectorizerManager,
         by_category: Dict[str, List[Tuple[str, str, Optional[Any]]]],
     ) -> None:
-        """按类别并行建索引：与串行逐类 `add_markets_batch` 数学上等价。"""
+        """按类别并行建索引；与逐类串行 `add_markets_batch` 等价。"""
         n_cat = len(by_category)
         if n_cat == 0:
             return
-        print(f"      并行构建 {n_cat} 个类别索引 (rayon)...")
+        print(f"      并行构建 {n_cat} 个类别索引...")
         tasks: List[Tuple[str, List[Tuple[str, str, Optional[Any]]], TextVectorizer]] = []
         for category in sorted(by_category.keys()):
             items = by_category[category]
@@ -201,186 +204,289 @@ class MarketMatcher:
 
         print(f"   ✅ Polymarket 索引构建完成，总市场数: {self.polymarket_vectorizers.total_size()}")
 
+    @staticmethod
+    def _top_k_similarities_for_row(
+        row: np.ndarray, threshold: float, max_results: int
+    ) -> List[Tuple[int, float]]:
+        if max_results == 0:
+            return []
+        hits = [(j, float(s)) for j, s in enumerate(row) if s >= threshold]
+        hits.sort(key=lambda x: x[1], reverse=True)
+        return hits[:max_results]
+
+    @classmethod
+    def _sweep_pm_to_ks_candidates_ordered(
+        cls,
+        p_mat: np.ndarray,
+        k_mat: np.ndarray,
+        pm_items: List[IndexItem],
+        ks_items: List[IndexItem],
+        chunk: int,
+        threshold: float,
+        top_k: int,
+    ) -> List[Tuple[str, str, float]]:
+        n_p = int(p_mat.shape[0])
+        if n_p == 0:
+            return []
+        k_t = np.ascontiguousarray(k_mat.T)
+        chunk = max(1, int(chunk))
+        starts = list(range(0, n_p, chunk))
+
+        def work(r0: int) -> Tuple[int, List[Tuple[str, str, float]]]:
+            r1 = min(r0 + chunk, n_p)
+            p_sl = p_mat[r0:r1, :]
+            scores = p_sl @ k_t
+            out: List[Tuple[str, str, float]] = []
+            for local in range(scores.shape[0]):
+                row_idx = r0 + local
+                pm_id = pm_items[row_idx].id
+                hits = cls._top_k_similarities_for_row(scores[local], threshold, top_k)
+                for j, sim in hits:
+                    ks_id = ks_items[j].id
+                    out.append((pm_id, ks_id, sim))
+            return r0, out
+
+        max_workers = min(32, max(1, len(starts)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            parts = list(ex.map(work, starts))
+        parts.sort(key=lambda x: x[0])
+        flat: List[Tuple[str, str, float]] = []
+        for _, v in parts:
+            flat.extend(v)
+        return flat
+
+    @classmethod
+    def _sweep_ks_to_pm_candidates_ordered(
+        cls,
+        p_mat: np.ndarray,
+        k_mat: np.ndarray,
+        pm_items: List[IndexItem],
+        ks_items: List[IndexItem],
+        chunk: int,
+        threshold: float,
+        top_k: int,
+    ) -> List[Tuple[str, str, float]]:
+        n_k = int(k_mat.shape[0])
+        if n_k == 0:
+            return []
+        p_t = np.ascontiguousarray(p_mat.T)
+        chunk = max(1, int(chunk))
+        starts = list(range(0, n_k, chunk))
+
+        def work(r0: int) -> Tuple[int, List[Tuple[str, str, float]]]:
+            r1 = min(r0 + chunk, n_k)
+            k_sl = k_mat[r0:r1, :]
+            scores = k_sl @ p_t
+            out: List[Tuple[str, str, float]] = []
+            for local in range(scores.shape[0]):
+                row_idx = r0 + local
+                ks_id = ks_items[row_idx].id
+                hits = cls._top_k_similarities_for_row(scores[local], threshold, top_k)
+                for j, sim in hits:
+                    pm_id = pm_items[j].id
+                    out.append((pm_id, ks_id, sim))
+            return r0, out
+
+        max_workers = min(32, max(1, len(starts)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            parts = list(ex.map(work, starts))
+        parts.sort(key=lambda x: x[0])
+        flat: List[Tuple[str, str, float]] = []
+        for _, v in parts:
+            flat.extend(v)
+        return flat
+
+    @staticmethod
+    def _fold_candidates_into_best(
+        best: Dict[Tuple[str, str], Tuple[float, str]],
+        pm: str,
+        ks: str,
+        sim: float,
+        cat: str,
+    ) -> None:
+        key = (pm, ks)
+        if key in best:
+            if sim > best[key][0]:
+                best[key] = (sim, cat)
+        else:
+            best[key] = (sim, cat)
+
+    def _try_push_pair_candidate(
+        self,
+        pm_id: str,
+        ks_id: str,
+        vector_sim: float,
+        category: str,
+        polymarket_cache: Dict[str, Market],
+        kalshi_cache: Dict[str, Market],
+        seen_accepted: Set[Tuple[str, str]],
+        validation_pipeline: ValidationPipeline,
+        out: List[Tuple[Market, Market, float, str, str, bool]],
+    ) -> None:
+        key = (pm_id, ks_id)
+        if key in seen_accepted:
+            return
+        pm = polymarket_cache.get(pm_id)
+        ks = kalshi_cache.get(ks_id)
+        if pm is None or ks is None:
+            return
+        match_info = validation_pipeline.validate(
+            pm.title, ks.title, vector_sim, category
+        )
+        if match_info:
+            confidence = self._calculate_confidence(
+                pm, ks, vector_sim, self.config
+            )
+            if confidence.overall_score >= self.config.similarity_threshold:
+                seen_accepted.add(key)
+                out.append(
+                    (
+                        pm,
+                        ks,
+                        confidence.overall_score,
+                        match_info.pm_side,
+                        match_info.kalshi_side,
+                        match_info.needs_inversion,
+                    )
+                )
+
+    def _find_matches_batched_sync(
+        self,
+    ) -> Tuple[List[Tuple[Market, Market, float, str, str, bool]], ValidationPipeline]:
+        start_time = datetime.now()
+        validation_pipeline = ValidationPipeline()
+        chunk = max(1, MATCH_MATMUL_CHUNK_ROWS)
+        best_by_pair: Dict[Tuple[str, str], Tuple[float, str]] = {}
+        cumulative_raw_hits = 0
+        categories_used = 0
+
+        polymarket_vec = self.polymarket_vectorizers
+        kalshi_vec = self.kalshi_vectorizers
+        polymarket_cache = self.polymarket_market_cache
+        kalshi_cache = self.kalshi_market_cache
+        cfg = self.config
+
+        for cat in polymarket_vec.get_all_categories():
+            pm_cv = polymarket_vec.get(cat)
+            ks_cv = kalshi_vec.get(cat)
+            if pm_cv is None or ks_cv is None:
+                continue
+            p_mat = pm_cv.index.data_matrix
+            k_mat = ks_cv.index.data_matrix
+            if p_mat is None or k_mat is None:
+                continue
+            if p_mat.shape[0] == 0 or k_mat.shape[0] == 0:
+                continue
+            if p_mat.shape[1] != k_mat.shape[1]:
+                print(
+                    f"   ⚠️  类别 {cat!r} Poly 与 Kalshi 向量维不一致 ({p_mat.shape[1]} vs {k_mat.shape[1]})，跳过"
+                )
+                continue
+            categories_used += 1
+            pm_items = pm_cv.index.items
+            ks_items = ks_cv.index.items
+            n_p, n_k = int(p_mat.shape[0]), int(k_mat.shape[0])
+            cat_started = datetime.now()
+
+            cand_pk = self._sweep_pm_to_ks_candidates_ordered(
+                np.asarray(p_mat, dtype=np.float64),
+                np.asarray(k_mat, dtype=np.float64),
+                pm_items,
+                ks_items,
+                chunk,
+                cfg.similarity_threshold,
+                SIMILARITY_TOP_K,
+            )
+            cand_kp = self._sweep_ks_to_pm_candidates_ordered(
+                np.asarray(p_mat, dtype=np.float64),
+                np.asarray(k_mat, dtype=np.float64),
+                pm_items,
+                ks_items,
+                chunk,
+                cfg.similarity_threshold,
+                SIMILARITY_TOP_K,
+            )
+            cat_raw = len(cand_pk) + len(cand_kp)
+            cumulative_raw_hits += cat_raw
+            for pm_id, ks_id, sim in cand_pk:
+                self._fold_candidates_into_best(best_by_pair, pm_id, ks_id, sim, cat)
+            for pm_id, ks_id, sim in cand_kp:
+                self._fold_candidates_into_best(best_by_pair, pm_id, ks_id, sim, cat)
+            print(
+                f"   ✓ #{categories_used} 「{cat}」Poly×Kalshi {n_p}×{n_k} · 本类初筛 {cat_raw} 条 · 累计初筛 {cumulative_raw_hits} 条 · {(datetime.now() - cat_started).total_seconds():.3f}s"
+            )
+
+        n_unique_pairs = len(best_by_pair)
+        merged: List[Tuple[str, str, float, str]] = [
+            (pm, ks, sim, c) for (pm, ks), (sim, c) in best_by_pair.items()
+        ]
+        merged.sort(key=lambda x: (x[0], x[1]))
+        seen_accepted: Set[Tuple[str, str]] = set()
+        all_raw: List[Tuple[Market, Market, float, str, str, bool]] = []
+
+        for pm_id, ks_id, sim, cat in merged:
+            self._try_push_pair_candidate(
+                pm_id,
+                ks_id,
+                sim,
+                cat,
+                polymarket_cache,
+                kalshi_cache,
+                seen_accepted,
+                validation_pipeline,
+                all_raw,
+            )
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(
+            f"   ✅ 大类 {categories_used} 个 · {elapsed:.3f}s · 初筛原始命中 {cumulative_raw_hits} 条 · 去重 {n_unique_pairs} 对 · 统一二筛保留 {len(all_raw)} 条"
+        )
+
+        return all_raw, validation_pipeline
+
     async def find_matches_bidirectional(
         self,
         pm_markets: List[Market],
         kalshi_markets: List[Market],
     ) -> List[Tuple[Market, Market, float, str, str, bool]]:
-        """双向查找匹配的市场对"""
+        """按大类矩阵初筛（P·Kᵀ / K·Pᵀ）后统一二筛；`pm_markets` / `kalshi_markets` 仅与旧接口兼容，实际使用已建索引。"""
+        del pm_markets, kalshi_markets
         if not self.fitted:
             print("⚠️ 索引未构建")
             return []
 
         self.validation_pipeline.reset_filtered_count()
 
-        print("\n🔍 ====== 开始双向匹配 ======")
-
-        # 克隆需要的数据用于并行任务
-        pm_markets_list = pm_markets.copy()
-        kalshi_markets_list = kalshi_markets.copy()
+        print("\n🔍 双向匹配：按大类 P·Kᵀ / K·Pᵀ 初筛（类内并行）→ 全类统一二筛")
 
         start_time = datetime.now()
 
-        print("\n📌 并行执行两个方向（spawn_blocking 确保 CPU 密集任务真并行）...")
+        all_raw, pipeline = await asyncio.to_thread(self._find_matches_batched_sync)
+        self.validation_pipeline = pipeline
 
-        # 与 Rust `tokio::task::spawn_blocking` 等价：在线程池跑 CPU 密集匹配，避免阻塞事件循环
-        results = await asyncio.gather(
-            asyncio.to_thread(
-                self._find_matches_directional_sync,
-                pm_markets_list,
-                self.kalshi_vectorizers,
-                self.category_mapper,
-                self.config,
-                self.kalshi_market_cache,
-                "PM→Kalshi",
-            ),
-            asyncio.to_thread(
-                self._find_matches_directional_sync,
-                kalshi_markets_list,
-                self.polymarket_vectorizers,
-                self.category_mapper,
-                self.config,
-                self.polymarket_market_cache,
-                "Kalshi→PM",
-            ),
+        initial_count = len(all_raw)
+        all_raw.sort(key=lambda x: x[2], reverse=True)
+
+        deduped: List[Tuple[Market, Market, float, str, str, bool]] = []
+        seen_m: Set[Tuple[str, str]] = set()
+        for t in all_raw:
+            key = (t[0].market_id, t[1].market_id)
+            if key not in seen_m:
+                seen_m.add(key)
+                deduped.append(t)
+
+        final_count = len(deduped)
+        merge_deduped = initial_count - final_count
+        self.validation_pipeline.filtered_count = merge_deduped
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(
+            f"\n📊 匹配：{elapsed:.3f}s · 二筛后列表 {initial_count} 条 · 按 market_id 去重后 {final_count} · 列表合并压掉 {merge_deduped}"
         )
-        matches1, pipeline1 = results[0]
-        matches2, pipeline2 = results[1]
-
-        initial_count = len(matches1) + len(matches2)
-
-        all_matches = []
-        seen_pairs = set()
-
-        # 处理方向1的匹配 (PM→Kalshi)
-        for m1, m2, score, pm_side, ks_side, needs_inversion in matches1:
-            pair_key = f"{m1.market_id}:{m2.market_id}"
-            reverse_key = f"{m2.market_id}:{m1.market_id}"
-
-            if pair_key not in seen_pairs and reverse_key not in seen_pairs:
-                seen_pairs.add(pair_key)
-                if m1.platform == "polymarket" and m2.platform == "kalshi":
-                    all_matches.append((m1, m2, score, pm_side, ks_side, needs_inversion))
-                else:
-                    # 如果方向反了，交换并保留方向信息
-                    all_matches.append((m2, m1, score, pm_side, ks_side, needs_inversion))
-
-        # 处理方向2的匹配 (Kalshi→PM)
-        for m1, m2, score, pm_side, ks_side, needs_inversion in matches2:
-            pair_key = f"{m2.market_id}:{m1.market_id}"
-            reverse_key = f"{m1.market_id}:{m2.market_id}"
-
-            if pair_key not in seen_pairs and reverse_key not in seen_pairs:
-                seen_pairs.add(pair_key)
-                # 方向2中，m1是Kalshi，m2是PM，需要交换并保留方向信息
-                all_matches.append((m2, m1, score, pm_side, ks_side, needs_inversion))
-
-        all_matches.sort(key=lambda x: x[2], reverse=True)
-
-        final_count = len(all_matches)
-        filtered_count = initial_count - final_count
-
-        self.validation_pipeline.filtered_count = filtered_count
-
-        # 合并留存样本
-        for cat, samples in pipeline1.retained_samples.items():
-            self.validation_pipeline.retained_samples[cat] = samples
-        for cat, samples in pipeline2.retained_samples.items():
-            self.validation_pipeline.retained_samples[cat] = samples
-
-        elapsed = datetime.now() - start_time
-        print(f"\n📊 ====== 匹配统计 ======")
-        print(f"   并行匹配耗时: {elapsed.total_seconds():.3f}s")
-        print(f"   初筛匹配对: {initial_count} 个")
-        print(f"   二筛过滤: {filtered_count} 个")
-        print(f"   二筛后待跟踪: {final_count} 个")
 
         self.validation_pipeline.print_retained_samples()
 
-        return all_matches
-
-    def _find_matches_directional_sync(
-        self,
-        query_markets: List[Market],
-        target_vectorizers: CategoryVectorizerManager,
-        category_mapper: CategoryMapper,
-        config: MarketMatcherConfig,
-        target_market_cache: Dict[str, Market],
-        direction_label: str,
-    ) -> Tuple[List[Tuple[Market, Market, float, str, str, bool]], ValidationPipeline]:
-        """同步版本：供线程池使用（与 Rust `find_matches_directional_sync` 对齐）。"""
-        all_matches = []
-        total = len(query_markets)
-        pipeline = ValidationPipeline()
-
-        print(f"      🔍 匹配 {total} 个市场 [{direction_label}]...")
-        start_time = datetime.now()
-        is_kalshi_pm = direction_label == "Kalshi→PM"
-
-        for idx, query_market in enumerate(query_markets):
-            if idx > 0 and idx % 1000 == 0:
-                elapsed = datetime.now() - start_time
-                avg_time = elapsed.total_seconds() * 1000 / idx
-                remaining = (total - idx) * avg_time / 1000
-                print(f"        进度: {idx}/{total} 个市场 [{direction_label}], 已用 {elapsed.total_seconds():.1f}s, 预计剩余 {remaining:.1f}s")
-
-            query_full_id = f"{query_market.platform}:{query_market.market_id}"
-            seen_qt: Set[Tuple[str, str]] = set()
-
-            query_categories = category_mapper.classify(query_market.title)
-
-            for category in query_categories:
-                vectorizer = target_vectorizers.get(category)
-                if not vectorizer:
-                    continue
-
-                similar = vectorizer.find_similar(
-                    query_market.title,
-                    config.similarity_threshold,
-                    SIMILARITY_TOP_K,
-                )
-
-                for item, similarity in similar:
-                    if (query_full_id, item.id) in seen_qt:
-                        continue
-                    seen_qt.add((query_full_id, item.id))
-
-                    target_market = target_market_cache.get(item.id)
-                    if not target_market:
-                        continue
-
-                    pm_title = target_market.title if is_kalshi_pm else query_market.title
-                    kalshi_title = query_market.title if is_kalshi_pm else target_market.title
-
-                    match_info = pipeline.validate(
-                        pm_title,
-                        kalshi_title,
-                        similarity,
-                        category,
-                    )
-
-                    if match_info:
-                        confidence = self._calculate_confidence(
-                            query_market,
-                            target_market,
-                            similarity,
-                            config,
-                        )
-
-                        if confidence.overall_score >= config.similarity_threshold:
-                            all_matches.append((
-                                query_market,
-                                target_market,
-                                confidence.overall_score,
-                                match_info.pm_side,
-                                match_info.kalshi_side,
-                                match_info.needs_inversion,
-                            ))
-
-        elapsed = datetime.now() - start_time
-        print(f"        匹配完成 [{direction_label}], 耗时: {elapsed.total_seconds():.1f}s, 找到 {len(all_matches)} 个匹配")
-
-        return all_matches, pipeline
+        return deduped
 
     def _calculate_confidence(
         self,

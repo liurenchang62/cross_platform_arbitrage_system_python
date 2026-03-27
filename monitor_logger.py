@@ -1,4 +1,4 @@
-# monitor_logger.py — 与 Rust `monitor_logger.rs` 对齐
+# monitor_logger.py — 按日 monitor_*.csv 追加套利行
 """按本地自然日追加：`logs/monitor_YYYY-MM-DD.csv`；每行一次验证通过的套利。"""
 
 from __future__ import annotations

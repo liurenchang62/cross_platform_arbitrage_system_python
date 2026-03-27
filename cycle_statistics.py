@@ -1,4 +1,4 @@
-# cycle_statistics.py — 与 Rust `cycle_statistics.rs` 对齐
+# cycle_statistics.py — 周期 Top10 / 全轮回撤等控制台统计
 # 大周期边界仅 `reset_big_period_accumulator()`，不输出「上一大周期总绩效」。
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def record_opportunity(opp: "ArbitrageOpportunity") -> None:
 
 
 def reset_big_period_accumulator() -> None:
-    """在下一全量匹配周期开始前调用：仅清零大周期累加器，不打印、不写报表（与 Rust 一致）。"""
+    """在下一全量匹配周期开始前调用：仅清零大周期累加器，不打印、不写报表。"""
     global _BIG_PERIOD
     with _LOCK:
         _BIG_PERIOD = _BigPeriodStats()
@@ -106,7 +106,7 @@ def format_full_cycle_roi_top10_only(rows: List[OpportunityTuple]) -> str:
 
 
 def _truncate_title(s: str, max_chars: int) -> str:
-    """按 Unicode 字符数截断（与 Rust `chars().count()` 一致）。"""
+    """按 Unicode 码位计数截断标题。"""
     chars = list(s)
     if len(chars) <= max_chars:
         return s

@@ -2,7 +2,7 @@
 #! 向量索引模块：在 L2 归一化 TF-IDF 向量上用 **精确余弦相似度**（等价于点积）检索。
 #!
 #! 与历史上基于 KD-Tree + 欧氏球半径的实现相比：在同一向量与同一阈值下，候选集合由
-#! `dot(q, v) >= threshold` 直接定义，无近似近邻；构建阶段堆叠为矩阵，与 Rust `vector_index.rs` 对齐。
+# `dot(q, v) >= threshold` 精确定义候选；构建阶段行堆叠为矩阵，无近似近邻库。
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class IndexItem:
 
 
 class VectorIndex:
-    """向量索引：行堆叠矩阵 + 精确点积检索（与 Rust `VectorIndex` 一致）"""
+    """向量索引：行堆叠矩阵 + 精确点积 Top-K / 阈值检索。"""
 
     def __init__(self, category_name: str, dimension: int = DEFAULT_DIMENSION_HINT):
         self.category_name = category_name
@@ -133,7 +133,7 @@ def _unit_vec2(x: float, y: float) -> np.ndarray:
 
 
 def _test_exact_top_matches_brute_force() -> None:
-    """与 Rust `vector_index::tests::exact_top_matches_brute_force` 等价"""
+    """与暴力全量点积排序结果一致（回归用）。"""
     idx = VectorIndex("t", dimension=2)
     items = [
         IndexItem(id="a", vector=_unit_vec2(1.0, 0.0)),

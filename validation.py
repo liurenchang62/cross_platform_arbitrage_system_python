@@ -1,5 +1,5 @@
 # validation.py
-#! 二筛模块：与 Rust `validation.rs` 对齐（逻辑、顺序、默认 Y/N 与过滤原因）
+# 二筛模块：固定顺序规则流水线（体育/政治、盘型互斥、默认 Y/N 腿与过滤原因）。
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# 预编译正则（对应 Rust Lazy<Regex>）
+# 预编译正则（模块加载时初始化）
 # ---------------------------------------------------------------------------
 ELECTORAL_STATE_DISTRICT_RE = re.compile(r"(?i)\b[a-z]{2}-\d{1,2}\b")
 ELECTORAL_NTH_PLACE_RE = re.compile(r"(?i)\b\d+(?:st|nd|rd|th)\s+place\b")
@@ -1687,7 +1687,7 @@ class ValidationPipeline:
 
 
 def _validation_smoke_tests() -> None:
-    """与 Rust `validation.rs` 中关键用例对齐的烟测。"""
+    """二筛规则烟测（关键用例回归）。"""
     pm = "Will Cloud9 New York win DreamHack Major 2?"
     ks = "New York R wins by over 2.5 goals? - New York R wins by over 2.5 goals"
     assert not EsportsTournamentWinnerVsSportsGoalsValidator.allows_pair(pm, ks)

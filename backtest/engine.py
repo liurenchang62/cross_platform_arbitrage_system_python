@@ -1,4 +1,4 @@
-# 与参考 `backtest/src/main.rs` 逻辑对齐的解析与报表（仅读 CSV，无副作用）
+# paper_trades.csv 解析与报表（只读，无副作用）
 from __future__ import annotations
 
 import csv

@@ -1,5 +1,5 @@
 # arbitrage_detector.py
-# 与参考实现对齐：100 USDT 探针、精确 n 份成本、Gas 两腿、双边 ask/bid 阶梯
+# 固定本金订单簿探针、精确 n 份成本、两腿 Gas、双边 ask/bid 阶梯 walk。
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,13 +8,13 @@ from market import MarketPrices
 
 # Gas 费配置（固定值，单位 USDT）— 每笔交易 $0.02，两腿共 $0.04
 GAS_FEE_PER_TX: float = 0.02
-# 兼容旧名：两腿总 Gas（与 Rust `calculate_arbitrage_with_direction` 中 `* 2.0` 一致）
+# 兼容旧名：两腿总 Gas（单笔 ×2）
 GAS_FEE: float = GAS_FEE_PER_TX * 2.0
 
 
 @dataclass
 class ArbitrageOpportunity:
-    """套利机会数据结构（与 Rust ArbitrageOpportunity 字段对齐）"""
+    """单边深度 walk 后的套利机会数值摘要。"""
     strategy: str
     kalshi_action: Tuple[str, str, float]
     polymarket_action: Tuple[str, str, float]
@@ -78,7 +78,7 @@ class ArbitrageDetector:
         capital_usdt: float,
         pair_cap_usdt: float = 0.0,
     ) -> Optional[ArbitrageOpportunity]:
-        """与 Rust `calculate_arbitrage_100usdt` 一致。"""
+        """按固定单腿本金 cap 与每对名义上限计算可对冲规模与净利。"""
         total_cost_opt = pm_optimal + kalshi_optimal
         if total_cost_opt >= 1.0 or total_cost_opt <= 0.0:
             return None
@@ -381,7 +381,7 @@ class ArbitrageDetector:
 
 
 def cost_for_exact_contracts(asks: List[Tuple[float, float]], n: float) -> Optional[Tuple[float, float]]:
-    """从卖盘（价格升序）吃进恰好 n 份合约；与 Rust 一致。"""
+    """从卖盘（价格升序）吃进恰好 n 份合约；流动性不足则返回 None。"""
     if n <= 0.0 or not math.isfinite(n):
         return None
     eps = 1e-9

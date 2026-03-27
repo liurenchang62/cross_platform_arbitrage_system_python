@@ -1,4 +1,4 @@
-# 交互式 CLI：与参考 `backtest` crate 流程一致
+# 交互式 CLI：按 UTC 会话起点解析 paper_trades.csv 并输出终端报表。
 from __future__ import annotations
 
 import os

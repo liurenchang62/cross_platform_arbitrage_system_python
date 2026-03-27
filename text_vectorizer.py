@@ -1,5 +1,5 @@
 # text_vectorizer.py
-#! TF-IDF 文本向量化模块（与 Rust `text_vectorizer.rs` 对齐：分词、Snowball English 词干、ceil(max_df)、IDF）
+# TF-IDF 文本向量化：分词、Snowball English 词干、ceil(max_df)、IDF
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from system_params import MAX_VOCAB_SIZE
 
 
 def get_stop_words() -> Set[str]:
-    """与 Rust `get_stop_words` 列表一致"""
+    """英文停用词与 domain 噪声词集合。"""
     return {
         "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is",
         "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there",
@@ -33,8 +33,8 @@ def get_stop_words() -> Set[str]:
     }
 
 
-def _split_words_rust_style(text: str) -> List[str]:
-    """等价 Rust: split(|c: char| !c.is_alphanumeric() && c != '-')"""
+def _split_words_boundary(text: str) -> List[str]:
+    """按非标点字符切分，保留连字符；字母统一小写。"""
     text = text.lower()
     words: List[str] = []
     current: List[str] = []
@@ -63,7 +63,7 @@ class VectorizerConfig:
 
 
 class TextVectorizer:
-    """文本向量化器（与 Rust `TextVectorizer` 行为对齐）"""
+    """TF-IDF 风格拟合与查询向量构建。"""
 
     def __init__(self, config: VectorizerConfig):
         self.config = config
@@ -94,7 +94,7 @@ class TextVectorizer:
         return dup
 
     def tokenize(self, text: str) -> List[str]:
-        words = _split_words_rust_style(text)
+        words = _split_words_boundary(text)
         result: List[str] = []
         for word in words:
             if "-" in word:
@@ -111,7 +111,7 @@ class TextVectorizer:
         return result
 
     def _process_token(self, token: str) -> Optional[str]:
-        # 纯 ASCII 数字（与 Rust `is_ascii_digit` 一致）
+        # 纯 ASCII 数字串
         if token and all("0" <= c <= "9" for c in token):
             if len(token) == 4 and token[0] in ("1", "2"):
                 return f"YEAR_{token}"
@@ -139,7 +139,7 @@ class TextVectorizer:
             for token in set(tokens):
                 doc_freq[token] += 1
 
-        # Rust: (max_df_ratio * n_docs).ceil() as usize
+        # 文档频率上限：ceil(max_df_ratio * n_docs)
         max_df = int(math.ceil(self.config.max_df_ratio * float(self.n_docs)))
 
         vocab_with_freq = [

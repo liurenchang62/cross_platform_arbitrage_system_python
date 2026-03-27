@@ -53,7 +53,7 @@ def parse_polymarket_gamma_market_row(
     category: Optional[str],
     tags: Optional[List[str]],
 ) -> Optional[Market]:
-    """Gamma 单条 market JSON → Market（与 Rust `parse_polymarket_gamma_market_row` 对齐）。"""
+    """Gamma 单条 market JSON → 内部 Market 结构。"""
     is_closed = market_data.get("closed", True)
     if not isinstance(is_closed, bool):
         is_closed = bool(is_closed)
