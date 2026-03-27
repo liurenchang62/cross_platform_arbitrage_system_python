@@ -120,7 +120,7 @@ class CategoryVectorizerManager:
         total = len(markets_by_category)
         if total == 0:
             return
-        print(f"      并行拟合 {total} 个类别 (rayon)...")
+        print(f"      并行拟合 {total} 个类别...")
         pairs = sorted(markets_by_category.items(), key=lambda x: x[0])
         max_workers = min(32, total)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:

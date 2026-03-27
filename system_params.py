@@ -9,11 +9,11 @@ RETRY_INITIAL_DELAY_MS = 1000
 
 # ==================== Polymarket 参数 ====================
 POLYMARKET_PAGE_LIMIT = 200
-POLYMARKET_MAX_MARKETS = 40000
+POLYMARKET_MAX_MARKETS = 50000
 
 # ==================== Kalshi 参数 ====================
 KALSHI_PAGE_LIMIT = 1000
-KALSHI_MAX_MARKETS = 40000
+KALSHI_MAX_MARKETS = 50000
 
 # Kalshi Demo：为 true 时必须配置 KALSHI_DEMO_* 环境变量；为 false 时使用生产 Trade API，并忽略 Demo 环境变量。
 KALSHI_DEMO_MODE_ENABLED = False

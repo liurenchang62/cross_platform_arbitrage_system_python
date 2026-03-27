@@ -30,6 +30,16 @@ def _parallel_build_category_worker(
     return category, cv
 
 
+def _fit_merged_one_category(
+    args: Tuple[str, List[str]],
+) -> Tuple[str, TextVectorizer]:
+    """每类在合并后的 Poly+Kalshi 标题上拟合一次 TF-IDF，供两侧索引共享同一词表。"""
+    category, titles = args
+    cv = CategoryVectorizer(category)
+    cv.fit(titles)
+    return category, copy.deepcopy(cv.vectorizer)
+
+
 @dataclass
 class MatchConfidence:
     """匹配结果置信度"""
@@ -78,8 +88,10 @@ class MarketMatcher:
         return self
 
     def fit_vectorizer(self, kalshi_markets: List[Market], polymarket_markets: List[Market]) -> None:
-        """按类别训练向量化器"""
-        print("📚 按类别训练向量化器...")
+        """按类别训练向量化器：每类合并两侧标题语料拟合一次，Kalshi / Polymarket 各持一份副本（维度一致）。"""
+        print(
+            "📚 按类别训练向量化器（每类合并 Poly + Kalshi 标题语料，词表与维度一致）..."
+        )
 
         kalshi_by_category: Dict[str, List[str]] = {}
         for market in kalshi_markets:
@@ -97,11 +109,34 @@ class MarketMatcher:
                     polymarket_by_category[cat] = []
                 polymarket_by_category[cat].append(market.title)
 
-        print(f"   📊 训练 Kalshi 类别向量化器...")
-        self.kalshi_vectorizers.fit_all(kalshi_by_category)
+        all_categories = set(kalshi_by_category.keys()) | set(
+            polymarket_by_category.keys()
+        )
+        merged_by_category: Dict[str, List[str]] = {}
+        for cat in all_categories:
+            docs = list(kalshi_by_category.get(cat, []))
+            docs.extend(polymarket_by_category.get(cat, []))
+            if docs:
+                merged_by_category[cat] = docs
 
-        print(f"   📊 训练 Polymarket 类别向量化器...")
-        self.polymarket_vectorizers.fit_all(polymarket_by_category)
+        self.kalshi_vectorizers.clear()
+        self.polymarket_vectorizers.clear()
+
+        n_cat = len(merged_by_category)
+        if n_cat == 0:
+            self.fitted = True
+            return
+
+        print(f"   📊 并行拟合 {n_cat} 个类别（合并语料 TF-IDF）...")
+        pairs = sorted(merged_by_category.items(), key=lambda x: x[0])
+        max_workers = min(32, n_cat)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fitted = list(ex.map(_fit_merged_one_category, pairs))
+        for category, vz in fitted:
+            cv_k = CategoryVectorizer.with_fitted_vectorizer(category, vz)
+            cv_p = CategoryVectorizer.with_fitted_vectorizer(category, vz)
+            self.kalshi_vectorizers.insert_built_category(category, cv_k)
+            self.polymarket_vectorizers.insert_built_category(category, cv_p)
 
         self.fitted = True
 
