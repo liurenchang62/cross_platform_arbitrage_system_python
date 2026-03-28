@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -19,10 +20,15 @@ from market_matcher import MarketMatcher, MarketMatcherConfig
 from arbitrage_detector import (
     ArbitrageDetector,
     ArbitrageOpportunity,
+    PairLadderBuildFail,
     build_pair_orderbook_ladders,
+    build_pair_orderbook_ladders_result,
+    orderbook_best_ask_price,
+    pm_buy_no_uses_yes_token_complement,
+    polymarket_clob_token_id_for_buy,
 )
 from monitor_logger import MonitorLogger
-from tracking import MonitorState, flip_binary_side, oriented_track_id
+from tracking import MonitorState, TrackedArbitrage, flip_binary_side, oriented_track_id
 from kalshi_demo import KalshiDemoConfig, KalshiDemoConfigError, place_demo_buy_ioc
 from system_params import (
     DEMO_REFERENCE_BUDGET_USD,
@@ -35,6 +41,8 @@ from system_params import (
     MAX_RETRIES,
     RETRY_INITIAL_DELAY_MS,
     SIMILARITY_THRESHOLD,
+    arb_track_concurrency,
+    arb_tracking_diagnostics_enabled,
     paper_caps_demo,
     paper_caps_local,
 )
@@ -42,6 +50,141 @@ from paper_trading import PaperEngine, validate_opportunity_from_ladders
 import cycle_statistics
 
 OpportunityRow = Tuple[ArbitrageOpportunity, str, str, Optional[datetime], Optional[datetime]]
+
+_MATCH_ROW_T = Tuple[Market, Market, float, str, str, bool]
+
+
+@dataclass
+class TrackingArbDiag:
+    attempts: int = 0
+    no_pm_clob_token: int = 0
+    pm_book_missing: int = 0
+    ks_book_missing: int = 0
+    ladders_failed: int = 0
+    ladder_pm_invalid_side: int = 0
+    ladder_pm_missing_bids: int = 0
+    ladder_pm_missing_asks: int = 0
+    ladder_pm_malformed: int = 0
+    ladder_pm_liq_empty_side: int = 0
+    ladder_pm_liq_all_filtered: int = 0
+    ladder_ks_no_body: int = 0
+    ladder_ks_invalid_side: int = 0
+    ladder_ks_malformed: int = 0
+    ladder_ks_liq_empty_side: int = 0
+    ladder_ks_liq_all_filtered: int = 0
+    rejected_strict: int = 0
+    missing_best_ask: int = 0
+    sum_ask_ge_1: int = 0
+    sum_ask_lt_1: int = 0
+    loose_pass_strict_fail: int = 0
+    loose_still_fail: int = 0
+    accepted: int = 0
+
+    def record_ladder_fail(self, r: PairLadderBuildFail) -> None:
+        self.ladders_failed += 1
+        if r == PairLadderBuildFail.PM_INVALID_BUY_SIDE:
+            self.ladder_pm_invalid_side += 1
+        elif r == PairLadderBuildFail.PM_MISSING_BIDS_ARRAY:
+            self.ladder_pm_missing_bids += 1
+        elif r == PairLadderBuildFail.PM_MISSING_ASKS_ARRAY:
+            self.ladder_pm_missing_asks += 1
+        elif r == PairLadderBuildFail.PM_MALFORMED_QUOTE:
+            self.ladder_pm_malformed += 1
+        elif r == PairLadderBuildFail.PM_NO_ASK_LIQUIDITY_EMPTY_SIDE:
+            self.ladder_pm_liq_empty_side += 1
+        elif r == PairLadderBuildFail.PM_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED:
+            self.ladder_pm_liq_all_filtered += 1
+        elif r == PairLadderBuildFail.KS_MISSING_ORDERBOOK_BODY:
+            self.ladder_ks_no_body += 1
+        elif r == PairLadderBuildFail.KS_INVALID_BUY_SIDE:
+            self.ladder_ks_invalid_side += 1
+        elif r == PairLadderBuildFail.KS_MALFORMED_QUOTE:
+            self.ladder_ks_malformed += 1
+        elif r == PairLadderBuildFail.KS_NO_ASK_LIQUIDITY_EMPTY_SIDE:
+            self.ladder_ks_liq_empty_side += 1
+        elif r == PairLadderBuildFail.KS_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED:
+            self.ladder_ks_liq_all_filtered += 1
+
+    def merge_from(self, o: TrackingArbDiag) -> None:
+        self.attempts += o.attempts
+        self.no_pm_clob_token += o.no_pm_clob_token
+        self.pm_book_missing += o.pm_book_missing
+        self.ks_book_missing += o.ks_book_missing
+        self.ladders_failed += o.ladders_failed
+        self.ladder_pm_invalid_side += o.ladder_pm_invalid_side
+        self.ladder_pm_missing_bids += o.ladder_pm_missing_bids
+        self.ladder_pm_missing_asks += o.ladder_pm_missing_asks
+        self.ladder_pm_malformed += o.ladder_pm_malformed
+        self.ladder_pm_liq_empty_side += o.ladder_pm_liq_empty_side
+        self.ladder_pm_liq_all_filtered += o.ladder_pm_liq_all_filtered
+        self.ladder_ks_no_body += o.ladder_ks_no_body
+        self.ladder_ks_invalid_side += o.ladder_ks_invalid_side
+        self.ladder_ks_malformed += o.ladder_ks_malformed
+        self.ladder_ks_liq_empty_side += o.ladder_ks_liq_empty_side
+        self.ladder_ks_liq_all_filtered += o.ladder_ks_liq_all_filtered
+        self.rejected_strict += o.rejected_strict
+        self.missing_best_ask += o.missing_best_ask
+        self.sum_ask_ge_1 += o.sum_ask_ge_1
+        self.sum_ask_lt_1 += o.sum_ask_lt_1
+        self.loose_pass_strict_fail += o.loose_pass_strict_fail
+        self.loose_still_fail += o.loose_still_fail
+        self.accepted += o.accepted
+
+    def print_summary(self) -> None:
+        print(
+            f"\n   🔎 ARB_TRACK_DIAG | 本周期尝试 {self.attempts} 次 | 通过严格检测 {self.accepted}"
+        )
+        print(
+            f"      前置失败：无 PM token {self.no_pm_clob_token} · PM 簿缺 {self.pm_book_missing} · "
+            f"KS 簿缺 {self.ks_book_missing} · 阶梯解析失败 {self.ladders_failed}"
+        )
+        if self.ladders_failed > 0:
+            print(
+                "      阶梯失败细分：PM 非Y/N {} · 缺bids {} · 缺asks {} · 档坏 {} · 空侧无行 {} · 有行全过滤 {} | "
+                "KS 无orderbook {} · 非Y/N {} · 档坏 {} · 空侧无行 {} · 有行全过滤 {}".format(
+                    self.ladder_pm_invalid_side,
+                    self.ladder_pm_missing_bids,
+                    self.ladder_pm_missing_asks,
+                    self.ladder_pm_malformed,
+                    self.ladder_pm_liq_empty_side,
+                    self.ladder_pm_liq_all_filtered,
+                    self.ladder_ks_no_body,
+                    self.ladder_ks_invalid_side,
+                    self.ladder_ks_malformed,
+                    self.ladder_ks_liq_empty_side,
+                    self.ladder_ks_liq_all_filtered,
+                )
+            )
+            print(
+                "      （流动性）空侧=该腿 asks/bids（或KS对应数组）0行；"
+                "全过滤=有行但均不满足 0<价<1 且 size>0（含反推价越界、非有限、量≤0）"
+            )
+        print(
+            f"      严格未过 {self.rejected_strict}：无最优Ask {self.missing_best_ask} · "
+            f"两卖价和≥1 → {self.sum_ask_ge_1} · 和<1 → {self.sum_ask_lt_1}"
+        )
+        print(
+            f"      和<1 子集：放宽 min_profit 可过 {self.loose_pass_strict_fail} · "
+            f"放宽仍否 {self.loose_still_fail}（多因深度/n 缩放）"
+        )
+        print(
+            "      （解读）和≥1 多为定价无结构套利；和<1 且放宽可过＝门槛/费用吃光；放宽仍否＝簿深度或计算路径问题"
+        )
+
+    def print_compact(self) -> None:
+        print(
+            "   📎 追踪判定摘要: 尝试 {} | 通过 {} | 无PM token {} | PM簿缺 {} KS簿缺 {} | 阶梯失败 {} | "
+            "严格拒 {} (其中和≥1: {})".format(
+                self.attempts,
+                self.accepted,
+                self.no_pm_clob_token,
+                self.pm_book_missing,
+                self.ks_book_missing,
+                self.ladders_failed,
+                self.rejected_strict,
+                self.sum_ask_ge_1,
+            )
+        )
 
 
 def _load_dotenv() -> None:
@@ -107,39 +250,75 @@ def format_resolution_expiry(label: str, dt: Optional[datetime]) -> str:
     return f"{label} 到期: {wall} UTC ({day_hint})"
 
 
-async def validate_arbitrage_pair(
+async def refresh_pm_market_from_gamma(
+    polymarket: PolymarketClient, target: Market
+) -> None:
+    try:
+        fresh_pm = await polymarket.fetch_market_snapshot_by_id(target.market_id)
+    except Exception:
+        return
+    target.outcome_prices = fresh_pm.outcome_prices or target.outcome_prices
+    target.best_ask = fresh_pm.best_ask if fresh_pm.best_ask is not None else target.best_ask
+    target.best_bid = fresh_pm.best_bid if fresh_pm.best_bid is not None else target.best_bid
+    target.last_trade_price = (
+        fresh_pm.last_trade_price
+        if fresh_pm.last_trade_price is not None
+        else target.last_trade_price
+    )
+    target.volume_24h = fresh_pm.volume_24h
+    if fresh_pm.token_ids:
+        target.token_ids = fresh_pm.token_ids
+    if target.resolution_date is None:
+        target.resolution_date = fresh_pm.resolution_date
+
+
+async def validate_arbitrage_core(
     polymarket: PolymarketClient,
     kalshi: KalshiClient,
     arb_detector: ArbitrageDetector,
     pm_market: Market,
     kalshi_market: Market,
-    similarity: float,
     pm_side: str,
     kalshi_side: str,
     needs_inversion: bool,
     capital_usdt: float,
     pair_cap_usdt: float,
-    per_leg_cap_usd: float,
-    cycle_id: int,
-    cycle_phase: str,
-    logger: MonitorLogger,
-    pair_label: str,
-    paper: Optional[PaperEngine],
-    demo_http: Optional[aiohttp.ClientSession],
-    kalshi_demo_cfg: Optional[KalshiDemoConfig],
-    demo_trading_active: List[bool],
+    arb_diag: Optional[TrackingArbDiag],
 ) -> Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime]]]:
+    if arb_diag is not None:
+        arb_diag.attempts += 1
     if not pm_market.token_ids:
+        if arb_diag is not None:
+            arb_diag.no_pm_clob_token += 1
         return None
-    tid = pm_market.token_ids[0]
-    pm_book = await polymarket.get_order_book(tid)
-    ks_book = await kalshi.get_order_book(kalshi_market.market_id)
-    if not pm_book or not ks_book:
+    pm_buy_no_via = pm_buy_no_uses_yes_token_complement(pm_market, pm_side)
+    tid_opt = polymarket_clob_token_id_for_buy(pm_market, pm_side)
+    if tid_opt is None:
+        if arb_diag is not None:
+            arb_diag.no_pm_clob_token += 1
+        return None
+    tid = tid_opt
+    pm_book, ks_book = await asyncio.gather(
+        polymarket.get_order_book(tid),
+        kalshi.get_order_book(kalshi_market.market_id),
+    )
+    if not pm_book:
+        if arb_diag is not None:
+            arb_diag.pm_book_missing += 1
+        return None
+    if not ks_book:
+        if arb_diag is not None:
+            arb_diag.ks_book_missing += 1
         return None
 
-    ladders = build_pair_orderbook_ladders(pm_book, ks_book, pm_side, kalshi_side)
-    if ladders is None:
+    ladders_r = build_pair_orderbook_ladders_result(
+        pm_book, ks_book, pm_side, kalshi_side, pm_buy_no_via
+    )
+    if isinstance(ladders_r, PairLadderBuildFail):
+        if arb_diag is not None:
+            arb_diag.record_ladder_fail(ladders_r)
         return None
+    ladders = ladders_r
 
     opp = validate_opportunity_from_ladders(
         arb_detector,
@@ -151,24 +330,82 @@ async def validate_arbitrage_pair(
         pair_cap_usdt,
     )
     if opp is None:
+        if arb_diag is not None:
+            arb_diag.rejected_strict += 1
+            p = orderbook_best_ask_price(ladders.pm_asks)
+            k = orderbook_best_ask_price(ladders.ks_asks)
+            if p is not None and k is not None:
+                if p + k >= 1.0:
+                    arb_diag.sum_ask_ge_1 += 1
+                else:
+                    arb_diag.sum_ask_lt_1 += 1
+                    loose = ArbitrageDetector(-1e100)
+                    if (
+                        validate_opportunity_from_ladders(
+                            loose,
+                            ladders,
+                            pm_side,
+                            kalshi_side,
+                            needs_inversion,
+                            capital_usdt,
+                            pair_cap_usdt,
+                        )
+                        is not None
+                    ):
+                        arb_diag.loose_pass_strict_fail += 1
+                    else:
+                        arb_diag.loose_still_fail += 1
+            else:
+                arb_diag.missing_best_ask += 1
         return None
 
-    pm_orderbook_vec = ladders.pm_asks
-    kalshi_orderbook_vec = ladders.ks_asks
-
-    inv = " (Y/N颠倒)" if needs_inversion else ""
-    pm_slip = ((opp.pm_avg_slipped - opp.pm_optimal) / opp.pm_optimal * 100.0) if opp.pm_optimal > 0.0 else 0.0
-    ks_slip = (
-        (opp.kalshi_avg_slipped - opp.kalshi_optimal) / opp.kalshi_optimal * 100.0
-    ) if opp.kalshi_optimal > 0.0 else 0.0
+    if arb_diag is not None:
+        arb_diag.accepted += 1
 
     pm_expiry = pm_market.resolution_date
     if pm_expiry is None:
         pm_expiry = await polymarket.fetch_resolution_by_market_id(pm_market.market_id)
-
     ks_expiry = kalshi_market.resolution_date
     if ks_expiry is None:
         ks_expiry = await kalshi.fetch_resolution_by_ticker(kalshi_market.market_id)
+
+    return (opp, pm_expiry, ks_expiry)
+
+
+async def validate_arbitrage_pair_post_success(
+    pm_market: Market,
+    kalshi_market: Market,
+    similarity: float,
+    pm_side: str,
+    kalshi_side: str,
+    needs_inversion: bool,
+    capital_usdt: float,
+    per_leg_cap_usd: float,
+    cycle_id: int,
+    cycle_phase: str,
+    logger: MonitorLogger,
+    pair_label: str,
+    paper: Optional[PaperEngine],
+    demo_http: Optional[aiohttp.ClientSession],
+    kalshi_demo_cfg: Optional[KalshiDemoConfig],
+    demo_trading_active: List[bool],
+    opp: ArbitrageOpportunity,
+    pm_expiry: Optional[datetime],
+    ks_expiry: Optional[datetime],
+) -> None:
+    tid_opt = polymarket_clob_token_id_for_buy(pm_market, pm_side)
+    if tid_opt is None:
+        return
+    tid = tid_opt
+    pm_buy_no_via = pm_buy_no_uses_yes_token_complement(pm_market, pm_side)
+
+    inv = " (Y/N颠倒)" if needs_inversion else ""
+    pm_slip = (
+        (opp.pm_avg_slipped - opp.pm_optimal) / opp.pm_optimal * 100.0
+    ) if opp.pm_optimal > 0.0 else 0.0
+    ks_slip = (
+        (opp.kalshi_avg_slipped - opp.kalshi_optimal) / opp.kalshi_optimal * 100.0
+    ) if opp.kalshi_optimal > 0.0 else 0.0
 
     print(f"\n  📌 验证通过 (相似度: {similarity:.3f}){inv}")
     print(f"     PM:      {pm_market.title}")
@@ -177,20 +414,22 @@ async def validate_arbitrage_pair(
     print(f"     📅 {format_resolution_expiry('Kalshi', ks_expiry)}")
     print("     ─────────────────────────────────────────────────────────")
     print(f"     📗 PM 订单簿(买{pm_side}) Top5:")
-    for j, (p, s) in enumerate(pm_orderbook_vec[:5]):
+    for j, (p, s) in enumerate(opp.orderbook_pm_top5[:5]):
         print(f"         #{j + 1}. 价 {p:.4f} 量 {s:.1f}")
-    if not pm_orderbook_vec:
+    if not opp.orderbook_pm_top5:
         print("         (无订单簿)")
     print(f"     📗 Kalshi 订单簿(买{kalshi_side}) Top5:")
-    for j, (p, s) in enumerate(kalshi_orderbook_vec[:5]):
+    for j, (p, s) in enumerate(opp.orderbook_kalshi_top5[:5]):
         print(f"         #{j + 1}. 价 {p:.4f} 量 {s:.1f}")
-    if not kalshi_orderbook_vec:
+    if not opp.orderbook_kalshi_top5:
         print("         (无订单簿)")
     print("     ─────────────────────────────────────────────────────────")
     print(f"     📊 策略: Polymarket 买 {pm_side}  +  Kalshi 买 {kalshi_side}")
     print("     ─────────────────────────────────────────────────────────")
     print(f"     📊 对冲份数 n: {opp.contracts:.4f}")
-    print(f"     💵 最优 Ask:     PM {opp.pm_optimal:.4f}  |  Kalshi {opp.kalshi_optimal:.4f}")
+    print(
+        f"     💵 最优 Ask:     PM {opp.pm_optimal:.4f}  |  Kalshi {opp.kalshi_optimal:.4f}"
+    )
     print(
         f"     📉 滑点后均价:   PM {opp.pm_avg_slipped:.4f} ({pm_slip:+.2f}%)  |  Kalshi {opp.kalshi_avg_slipped:.4f} ({ks_slip:+.2f}%)"
     )
@@ -282,11 +521,73 @@ async def validate_arbitrage_pair(
                 tid,
                 datetime.now(timezone.utc),
                 ks_exec_notes,
+                pm_buy_no_via,
             )
         except Exception as e:
             print(f"   ⚠️ [Paper] try_open 失败: {e}")
 
-    return (opp, pm_expiry, ks_expiry)
+
+async def validate_arbitrage_pair(
+    polymarket: PolymarketClient,
+    kalshi: KalshiClient,
+    arb_detector: ArbitrageDetector,
+    pm_market: Market,
+    kalshi_market: Market,
+    similarity: float,
+    pm_side: str,
+    kalshi_side: str,
+    needs_inversion: bool,
+    capital_usdt: float,
+    pair_cap_usdt: float,
+    per_leg_cap_usd: float,
+    cycle_id: int,
+    cycle_phase: str,
+    logger: MonitorLogger,
+    pair_label: str,
+    paper: Optional[PaperEngine],
+    demo_http: Optional[aiohttp.ClientSession],
+    kalshi_demo_cfg: Optional[KalshiDemoConfig],
+    demo_trading_active: List[bool],
+    arb_diag: Optional[TrackingArbDiag] = None,
+) -> Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime]]]:
+    core = await validate_arbitrage_core(
+        polymarket,
+        kalshi,
+        arb_detector,
+        pm_market,
+        kalshi_market,
+        pm_side,
+        kalshi_side,
+        needs_inversion,
+        capital_usdt,
+        pair_cap_usdt,
+        arb_diag,
+    )
+    if core is None:
+        return None
+    opp, pm_exp, ks_exp = core
+    await validate_arbitrage_pair_post_success(
+        pm_market,
+        kalshi_market,
+        similarity,
+        pm_side,
+        kalshi_side,
+        needs_inversion,
+        capital_usdt,
+        per_leg_cap_usd,
+        cycle_id,
+        cycle_phase,
+        logger,
+        pair_label,
+        paper,
+        demo_http,
+        kalshi_demo_cfg,
+        demo_trading_active,
+        opp,
+        pm_exp,
+        ks_exp,
+    )
+    return (opp, pm_exp, ks_exp)
 
 
 async def paper_cycle_start_close_checks(
@@ -315,7 +616,11 @@ async def paper_cycle_start_close_checks(
             )
             continue
         ladders = build_pair_orderbook_ladders(
-            pm_book, ks_book, pos.pm_side, pos.kalshi_side
+            pm_book,
+            ks_book,
+            pos.pm_side,
+            pos.kalshi_side,
+            pos.pm_buy_no_via_yes_book_bids,
         )
         if ladders is None:
             paper.log_no_close_book_error(
@@ -420,42 +725,111 @@ async def run_full_match_work(
 
     verified_count = 0
     opportunities: List[OpportunityRow] = []
+    conc = arb_track_concurrency()
+    full_cycle_id = monitor_state.current_cycle
 
-    for pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion in matches:
-        pair_label = oriented_track_id(
-            pm_market.market_id,
-            kalshi_market.market_id,
-            pm_side,
-            kalshi_side,
+    if conc <= 1:
+        for pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion in matches:
+            pair_label = oriented_track_id(
+                pm_market.market_id,
+                kalshi_market.market_id,
+                pm_side,
+                kalshi_side,
+            )
+            validated = await validate_arbitrage_pair(
+                polymarket,
+                kalshi,
+                arb_detector,
+                pm_market,
+                kalshi_market,
+                similarity,
+                pm_side,
+                kalshi_side,
+                needs_inversion,
+                trade_amount,
+                pair_cap_usdt,
+                per_leg_cap_usd,
+                full_cycle_id,
+                "full_match",
+                logger,
+                pair_label,
+                paper,
+                demo_http,
+                kalshi_demo_cfg,
+                demo_trading_active,
+                None,
+            )
+            if validated:
+                verified, pm_exp, ks_exp = validated
+                verified_count += 1
+                cycle_statistics.record_opportunity(verified)
+                opportunities.append(
+                    (verified, pm_market.title, kalshi_market.title, pm_exp, ks_exp)
+                )
+    else:
+        print(
+            f"      … 全量套利验证并发 {conc}（{len(matches)} 条配置，与追踪共用 ARB_TRACK_CONCURRENCY）"
         )
-        validated = await validate_arbitrage_pair(
-            polymarket,
-            kalshi,
-            arb_detector,
-            pm_market,
-            kalshi_market,
-            similarity,
-            pm_side,
-            kalshi_side,
-            needs_inversion,
-            trade_amount,
-            pair_cap_usdt,
-            per_leg_cap_usd,
-            monitor_state.current_cycle,
-            "full_match",
-            logger,
-            pair_label,
-            paper,
-            demo_http,
-            kalshi_demo_cfg,
-            demo_trading_active,
-        )
-        if validated:
-            verified, pm_exp, ks_exp = validated
+        sem = asyncio.Semaphore(conc)
+
+        async def _full_one(row: _MATCH_ROW_T) -> Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime], str, _MATCH_ROW_T]]:
+            pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion = row
+            pair_label = oriented_track_id(
+                pm_market.market_id,
+                kalshi_market.market_id,
+                pm_side,
+                kalshi_side,
+            )
+            async with sem:
+                core = await validate_arbitrage_core(
+                    polymarket,
+                    kalshi,
+                    arb_detector,
+                    pm_market,
+                    kalshi_market,
+                    pm_side,
+                    kalshi_side,
+                    needs_inversion,
+                    trade_amount,
+                    pair_cap_usdt,
+                    None,
+                )
+            if core is None:
+                return None
+            opp, pm_exp, ks_exp = core
+            return (opp, pm_exp, ks_exp, pair_label, row)
+
+        chunk = await asyncio.gather(*[_full_one(row) for row in matches])
+        for item in chunk:
+            if item is None:
+                continue
+            opp, pm_exp, ks_exp, pair_label, row = item
+            pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion = row
+            await validate_arbitrage_pair_post_success(
+                pm_market,
+                kalshi_market,
+                similarity,
+                pm_side,
+                kalshi_side,
+                needs_inversion,
+                trade_amount,
+                per_leg_cap_usd,
+                full_cycle_id,
+                "full_match",
+                logger,
+                pair_label,
+                paper,
+                demo_http,
+                kalshi_demo_cfg,
+                demo_trading_active,
+                opp,
+                pm_exp,
+                ks_exp,
+            )
             verified_count += 1
-            cycle_statistics.record_opportunity(verified)
+            cycle_statistics.record_opportunity(opp)
             opportunities.append(
-                (verified, pm_market.title, kalshi_market.title, pm_exp, ks_exp)
+                (opp, pm_market.title, kalshi_market.title, pm_exp, ks_exp)
             )
 
     top10_block = format_top10_opportunities(opportunities, top10_mode_caption)
@@ -539,61 +913,144 @@ async def run_tracking_cycle(
 
     opportunity_count = 0
     opportunities: List[OpportunityRow] = []
+    diag_verbose = arb_tracking_diagnostics_enabled()
+    conc = arb_track_concurrency()
+    n_active = sum(1 for p in monitor_state.tracked_pairs if p.active)
+    tick_start = datetime.now()
 
-    for pair in monitor_state.tracked_pairs:
-        if not pair.active:
-            continue
+    diag_total = TrackingArbDiag()
 
-        try:
-            fresh_pm = await polymarket.fetch_market_snapshot_by_id(pair.pm_market.market_id)
-            pair.pm_market.outcome_prices = fresh_pm.outcome_prices or pair.pm_market.outcome_prices
-            pair.pm_market.best_ask = fresh_pm.best_ask if fresh_pm.best_ask is not None else pair.pm_market.best_ask
-            pair.pm_market.best_bid = fresh_pm.best_bid if fresh_pm.best_bid is not None else pair.pm_market.best_bid
-            pair.pm_market.last_trade_price = (
-                fresh_pm.last_trade_price
-                if fresh_pm.last_trade_price is not None
-                else pair.pm_market.last_trade_price
+    if conc <= 1 or n_active == 0:
+        done_active = 0
+        diag_slot = TrackingArbDiag()
+        for pair in monitor_state.tracked_pairs:
+            if not pair.active:
+                continue
+            done_active += 1
+            await refresh_pm_market_from_gamma(polymarket, pair.pm_market)
+            if done_active % 25 == 0 or done_active == n_active:
+                elapsed = (datetime.now() - tick_start).total_seconds()
+                print(
+                    f"      … 追踪校验进度 {done_active}/{n_active}，已用 {elapsed:.1f}s"
+                )
+
+            validated = await validate_arbitrage_pair(
+                polymarket,
+                kalshi,
+                arb_detector,
+                pair.pm_market,
+                pair.kalshi_market,
+                pair.similarity,
+                pair.pm_side,
+                pair.kalshi_side,
+                pair.needs_inversion,
+                trade_amount,
+                pair_cap_usdt,
+                per_leg_cap_usd,
+                monitor_state.current_cycle,
+                "price_track",
+                logger,
+                pair.pair_id,
+                paper,
+                demo_http,
+                kalshi_demo_cfg,
+                demo_trading_active,
+                diag_slot,
             )
-            pair.pm_market.volume_24h = fresh_pm.volume_24h
-            if fresh_pm.token_ids:
-                pair.pm_market.token_ids = fresh_pm.token_ids
-            if pair.pm_market.resolution_date is None:
-                pair.pm_market.resolution_date = fresh_pm.resolution_date
-        except Exception:
-            pass
-
-        validated = await validate_arbitrage_pair(
-            polymarket,
-            kalshi,
-            arb_detector,
-            pair.pm_market,
-            pair.kalshi_market,
-            pair.similarity,
-            pair.pm_side,
-            pair.kalshi_side,
-            pair.needs_inversion,
-            trade_amount,
-            pair_cap_usdt,
-            per_leg_cap_usd,
-            monitor_state.current_cycle,
-            "price_track",
-            logger,
-            pair.pair_id,
-            paper,
-            demo_http,
-            kalshi_demo_cfg,
-            demo_trading_active,
+            if validated:
+                verified, pm_exp, ks_exp = validated
+                opportunity_count += 1
+                cycle_statistics.record_opportunity(verified)
+                pair.last_check = datetime.now(timezone.utc)
+                if verified.net_profit_100 > pair.best_profit:
+                    pair.best_profit = verified.net_profit_100
+                opportunities.append(
+                    (verified, pair.pm_market.title, pair.kalshi_market.title, pm_exp, ks_exp)
+                )
+        diag_total = diag_slot
+    else:
+        print(
+            f"      … 使用并发 {conc} 校验 {n_active} 个活跃对（Gamma 仍每对一次，PM/KS 簿并行拉取）"
         )
-        if validated:
-            verified, pm_exp, ks_exp = validated
-            opportunity_count += 1
-            cycle_statistics.record_opportunity(verified)
-            pair.last_check = datetime.now(timezone.utc)
-            if verified.net_profit_100 > pair.best_profit:
-                pair.best_profit = verified.net_profit_100
-            opportunities.append(
-                (verified, pair.pm_market.title, pair.kalshi_market.title, pm_exp, ks_exp)
+        jobs: List[Tuple[int, TrackedArbitrage]] = [
+            (i, deepcopy(p))
+            for i, p in enumerate(monitor_state.tracked_pairs)
+            if p.active
+        ]
+        sem = asyncio.Semaphore(conc)
+
+        async def work(
+            idx: int, pair: TrackedArbitrage
+        ) -> Tuple[
+            int,
+            TrackedArbitrage,
+            Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime]]],
+            TrackingArbDiag,
+        ]:
+            await refresh_pm_market_from_gamma(polymarket, pair.pm_market)
+            frag = TrackingArbDiag()
+            async with sem:
+                core = await validate_arbitrage_core(
+                    polymarket,
+                    kalshi,
+                    arb_detector,
+                    pair.pm_market,
+                    pair.kalshi_market,
+                    pair.pm_side,
+                    pair.kalshi_side,
+                    pair.needs_inversion,
+                    trade_amount,
+                    pair_cap_usdt,
+                    frag,
+                )
+            return idx, pair, core, frag
+
+        results = await asyncio.gather(*[work(i, p) for i, p in jobs])
+        for idx, pair_snap, core_res, frag in results:
+            diag_total.merge_from(frag)
+            tr = monitor_state.tracked_pairs[idx]
+            tr.pm_market = pair_snap.pm_market
+            if core_res is None:
+                continue
+            opp, pm_exp, ks_exp = core_res
+            await validate_arbitrage_pair_post_success(
+                tr.pm_market,
+                tr.kalshi_market,
+                tr.similarity,
+                tr.pm_side,
+                tr.kalshi_side,
+                tr.needs_inversion,
+                trade_amount,
+                per_leg_cap_usd,
+                monitor_state.current_cycle,
+                "price_track",
+                logger,
+                tr.pair_id,
+                paper,
+                demo_http,
+                kalshi_demo_cfg,
+                demo_trading_active,
+                opp,
+                pm_exp,
+                ks_exp,
             )
+            opportunity_count += 1
+            cycle_statistics.record_opportunity(opp)
+            tr.last_check = datetime.now(timezone.utc)
+            if opp.net_profit_100 > tr.best_profit:
+                tr.best_profit = opp.net_profit_100
+            opportunities.append(
+                (opp, tr.pm_market.title, tr.kalshi_market.title, pm_exp, ks_exp)
+            )
+        print(
+            "      … 并发追踪校验结束，总用时 "
+            f"{(datetime.now() - tick_start).total_seconds():.1f}s"
+        )
+
+    if diag_verbose:
+        diag_total.print_summary()
+    else:
+        diag_total.print_compact()
 
     top10_block = format_top10_opportunities(opportunities, top10_mode_caption)
     print(top10_block, end="")
@@ -770,6 +1227,13 @@ async def main_async() -> None:
 
     matcher = MarketMatcher(matcher_config, category_mapper).with_logger(unclassified_logger)
     arb_detector = ArbitrageDetector(0.02)
+    if arb_tracking_diagnostics_enabled():
+        print(
+            "   🔎 已启用 ARB_TRACK_DIAG：价格追踪周期末打印套利判定分层统计"
+        )
+    print(
+        f"   🚀 价格追踪并发 ARB_TRACK_CONCURRENCY={arb_track_concurrency()}（环境变量可改，1=完全串行）"
+    )
     monitor_state = MonitorState(FULL_FETCH_INTERVAL, 10000)
     paper_engine = PaperEngine.try_new()
 

@@ -2,9 +2,10 @@
 # 固定本金订单簿探针、精确 n 份成本、两腿 Gas、双边 ask/bid 阶梯 walk。
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from enum import Enum, auto
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from market import MarketPrices
+from market import Market, MarketPrices
 
 # Gas 费配置（固定值，单位 USDT）— 每笔交易 $0.02，两腿共 $0.04
 GAS_FEE_PER_TX: float = 0.02
@@ -451,60 +452,187 @@ def _json_float(v) -> float:
         return 0.0
 
 
-def parse_polymarket_orderbook(data: dict, side: str) -> Optional[List[Tuple[float, float]]]:
-    if side == "YES":
-        asks = data.get("asks", [])
-        result = []
-        for ask in asks:
-            price = _json_float(ask.get("price"))
-            size = _json_float(ask.get("size"))
-            result.append((price, size))
-        result.sort(key=lambda x: x[0])
-        return result
+def _json_num_field(v) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        x = float(v)
+        return x if math.isfinite(x) else None
+    try:
+        x = float(str(v).strip())
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
 
-    if side == "NO":
-        bids = data.get("bids", [])
-        result = []
+
+def ladder_level_ok(price: float, size: float) -> bool:
+    return (
+        math.isfinite(price)
+        and math.isfinite(size)
+        and price > 0.0
+        and price < 1.0
+        and size > 0.0
+    )
+
+
+class PairLadderBuildFail(Enum):
+    PM_INVALID_BUY_SIDE = auto()
+    PM_MISSING_BIDS_ARRAY = auto()
+    PM_MISSING_ASKS_ARRAY = auto()
+    PM_MALFORMED_QUOTE = auto()
+    PM_NO_ASK_LIQUIDITY_EMPTY_SIDE = auto()
+    PM_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED = auto()
+    KS_MISSING_ORDERBOOK_BODY = auto()
+    KS_INVALID_BUY_SIDE = auto()
+    KS_MALFORMED_QUOTE = auto()
+    KS_NO_ASK_LIQUIDITY_EMPTY_SIDE = auto()
+    KS_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED = auto()
+
+
+def polymarket_clob_token_id_for_buy(pm: Market, buy_side: str) -> Optional[str]:
+    if buy_side == "YES":
+        return pm.token_ids[0] if pm.token_ids else None
+    if buy_side == "NO":
+        if len(pm.token_ids) >= 2:
+            return pm.token_ids[1]
+        return pm.token_ids[0] if pm.token_ids else None
+    return pm.token_ids[0] if pm.token_ids else None
+
+
+def pm_buy_no_uses_yes_token_complement(pm: Market, buy_side: str) -> bool:
+    return buy_side == "NO" and len(pm.token_ids) < 2
+
+
+def try_parse_polymarket_buy_asks(
+    data: dict,
+    buy_side: str,
+    buy_no_via_yes_token_bids: bool,
+) -> Union[List[Tuple[float, float]], PairLadderBuildFail]:
+    if buy_side not in ("YES", "NO"):
+        return PairLadderBuildFail.PM_INVALID_BUY_SIDE
+    if buy_side == "NO" and buy_no_via_yes_token_bids:
+        bids = data.get("bids")
+        if not isinstance(bids, list):
+            return PairLadderBuildFail.PM_MISSING_BIDS_ARRAY
+        n_rows = len(bids)
+        result: List[Tuple[float, float]] = []
         for bid in bids:
-            bid_price = _json_float(bid.get("price"))
-            size = _json_float(bid.get("size"))
+            if not isinstance(bid, dict):
+                return PairLadderBuildFail.PM_MALFORMED_QUOTE
+            pp = _json_num_field(bid.get("price"))
+            sz = _json_num_field(bid.get("size"))
+            if pp is None or sz is None:
+                return PairLadderBuildFail.PM_MALFORMED_QUOTE
+            ask_price = 1.0 - pp
+            if ladder_level_ok(ask_price, sz):
+                result.append((ask_price, sz))
+        result.sort(key=lambda x: x[0])
+        if not result:
+            return (
+                PairLadderBuildFail.PM_NO_ASK_LIQUIDITY_EMPTY_SIDE
+                if n_rows == 0
+                else PairLadderBuildFail.PM_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED
+            )
+        return result
+    asks = data.get("asks")
+    if not isinstance(asks, list):
+        return PairLadderBuildFail.PM_MISSING_ASKS_ARRAY
+    n_rows = len(asks)
+    result = []
+    for ask in asks:
+        if not isinstance(ask, dict):
+            return PairLadderBuildFail.PM_MALFORMED_QUOTE
+        price = _json_num_field(ask.get("price"))
+        size = _json_num_field(ask.get("size"))
+        if price is None or size is None:
+            return PairLadderBuildFail.PM_MALFORMED_QUOTE
+        if ladder_level_ok(price, size):
+            result.append((price, size))
+    result.sort(key=lambda x: x[0])
+    if not result:
+        return (
+            PairLadderBuildFail.PM_NO_ASK_LIQUIDITY_EMPTY_SIDE
+            if n_rows == 0
+            else PairLadderBuildFail.PM_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED
+        )
+    return result
+
+
+def parse_polymarket_orderbook(data: dict, side: str) -> Optional[List[Tuple[float, float]]]:
+    r = try_parse_polymarket_buy_asks(data, side, side == "NO")
+    return r if isinstance(r, list) else None
+
+
+def _kalshi_orderbook_body(data: dict) -> Optional[dict]:
+    ob = data.get("orderbook_fp")
+    if isinstance(ob, dict):
+        return ob
+    ob2 = data.get("orderbook")
+    return ob2 if isinstance(ob2, dict) else None
+
+
+def try_parse_kalshi_orderbook(
+    data: dict, side: str
+) -> Union[List[Tuple[float, float]], PairLadderBuildFail]:
+    orderbook = _kalshi_orderbook_body(data)
+    if orderbook is None:
+        return PairLadderBuildFail.KS_MISSING_ORDERBOOK_BODY
+    if side == "YES":
+        no_bids = orderbook.get("no_dollars", [])
+        if not isinstance(no_bids, list):
+            no_bids = []
+        n_rows = len(no_bids)
+        result: List[Tuple[float, float]] = []
+        for entry in no_bids:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                return PairLadderBuildFail.KS_MALFORMED_QUOTE
+            bid_price = _json_num_field(entry[0])
+            size = _json_num_field(entry[1])
+            if bid_price is None or size is None:
+                return PairLadderBuildFail.KS_MALFORMED_QUOTE
             ask_price = 1.0 - bid_price
-            if 0.01 < ask_price < 1.0:
+            if ladder_level_ok(ask_price, size):
                 result.append((ask_price, size))
         result.sort(key=lambda x: x[0])
+        if not result:
+            return (
+                PairLadderBuildFail.KS_NO_ASK_LIQUIDITY_EMPTY_SIDE
+                if n_rows == 0
+                else PairLadderBuildFail.KS_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED
+            )
         return result
-
-    return None
+    if side == "NO":
+        yes_bids = orderbook.get("yes_dollars", [])
+        if not isinstance(yes_bids, list):
+            yes_bids = []
+        n_rows = len(yes_bids)
+        result = []
+        for entry in yes_bids:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                return PairLadderBuildFail.KS_MALFORMED_QUOTE
+            bid_price = _json_num_field(entry[0])
+            size = _json_num_field(entry[1])
+            if bid_price is None or size is None:
+                return PairLadderBuildFail.KS_MALFORMED_QUOTE
+            ask_price = 1.0 - bid_price
+            if ladder_level_ok(ask_price, size):
+                result.append((ask_price, size))
+        result.sort(key=lambda x: x[0])
+        if not result:
+            return (
+                PairLadderBuildFail.KS_NO_ASK_LIQUIDITY_EMPTY_SIDE
+                if n_rows == 0
+                else PairLadderBuildFail.KS_NO_ASK_LIQUIDITY_ALL_ROWS_FILTERED
+            )
+        return result
+    return PairLadderBuildFail.KS_INVALID_BUY_SIDE
 
 
 def parse_kalshi_orderbook(data: dict, side: str) -> Optional[List[Tuple[float, float]]]:
-    orderbook = data.get("orderbook_fp", {})
-
-    if side == "YES":
-        no_bids = orderbook.get("no_dollars", [])
-        result = []
-        for entry in no_bids:
-            bid_price = _json_float(entry[0])
-            size = _json_float(entry[1])
-            ask_price = 1.0 - bid_price
-            if 0.01 < ask_price < 1.0:
-                result.append((ask_price, size))
-        result.sort(key=lambda x: x[0])
-        return result
-
-    if side == "NO":
-        yes_bids = orderbook.get("yes_dollars", [])
-        result = []
-        for entry in yes_bids:
-            bid_price = _json_float(entry[0])
-            size = _json_float(entry[1])
-            ask_price = 1.0 - bid_price
-            if 0.01 < ask_price < 1.0:
-                result.append((ask_price, size))
-        result.sort(key=lambda x: x[0])
-        return result
-
-    return None
+    r = try_parse_kalshi_orderbook(data, side)
+    return r if isinstance(r, list) else None
 
 
 # ==================== 卖出侧（bid 阶梯）用于模拟平仓 ====================
@@ -527,9 +655,9 @@ def parse_polymarket_bids_desc(data: dict, side: str) -> Optional[List[Tuple[flo
     for bid in bids:
         if not isinstance(bid, dict):
             continue
-        price = _json_float(bid.get("price"))
-        size = _json_float(bid.get("size"))
-        if price > 0.0 and size > 0.0:
+        price = _json_num_field(bid.get("price"))
+        size = _json_num_field(bid.get("size"))
+        if price is not None and size is not None and ladder_level_ok(price, size):
             result.append((price, size))
     if not result:
         return None
@@ -538,8 +666,8 @@ def parse_polymarket_bids_desc(data: dict, side: str) -> Optional[List[Tuple[flo
 
 
 def parse_kalshi_bids_desc(data: dict, side: str) -> Optional[List[Tuple[float, float]]]:
-    orderbook = data.get("orderbook_fp")
-    if not isinstance(orderbook, dict):
+    orderbook = _kalshi_orderbook_body(data)
+    if orderbook is None:
         return None
     if side == "YES":
         arr = orderbook.get("yes_dollars", [])
@@ -553,9 +681,9 @@ def parse_kalshi_bids_desc(data: dict, side: str) -> Optional[List[Tuple[float, 
     for entry in arr:
         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
             continue
-        bid_price = _json_float(entry[0])
-        size = _json_float(entry[1])
-        if 0.01 < bid_price < 1.0 and size > 0.0:
+        bid_price = _json_num_field(entry[0])
+        size = _json_num_field(entry[1])
+        if bid_price is not None and size is not None and ladder_level_ok(bid_price, size):
             result.append((bid_price, size))
     if not result:
         return None
@@ -563,24 +691,40 @@ def parse_kalshi_bids_desc(data: dict, side: str) -> Optional[List[Tuple[float, 
     return result
 
 
+def build_pair_orderbook_ladders_result(
+    pm_book: Dict[str, Any],
+    ks_book: Dict[str, Any],
+    pm_side: str,
+    ks_side: str,
+    pm_buy_no_via_yes_book_bids: bool,
+) -> Union[PairOrderbookLadders, PairLadderBuildFail]:
+    pm_r = try_parse_polymarket_buy_asks(pm_book, pm_side, pm_buy_no_via_yes_book_bids)
+    if isinstance(pm_r, PairLadderBuildFail):
+        return pm_r
+    ks_r = try_parse_kalshi_orderbook(ks_book, ks_side)
+    if isinstance(ks_r, PairLadderBuildFail):
+        return ks_r
+    pm_bids = parse_polymarket_bids_desc(pm_book, pm_side) or []
+    ks_bids = parse_kalshi_bids_desc(ks_book, ks_side) or []
+    return PairOrderbookLadders(
+        pm_asks=pm_r,
+        ks_asks=ks_r,
+        pm_bids_desc=pm_bids,
+        ks_bids_desc=ks_bids,
+    )
+
+
 def build_pair_orderbook_ladders(
     pm_book: Dict[str, Any],
     ks_book: Dict[str, Any],
     pm_side: str,
     ks_side: str,
+    pm_buy_no_via_yes_book_bids: bool,
 ) -> Optional[PairOrderbookLadders]:
-    pm_asks = parse_polymarket_orderbook(pm_book, pm_side)
-    ks_asks = parse_kalshi_orderbook(ks_book, ks_side)
-    pm_bids_desc = parse_polymarket_bids_desc(pm_book, pm_side)
-    ks_bids_desc = parse_kalshi_bids_desc(ks_book, ks_side)
-    if pm_asks is None or ks_asks is None or pm_bids_desc is None or ks_bids_desc is None:
-        return None
-    return PairOrderbookLadders(
-        pm_asks=pm_asks,
-        ks_asks=ks_asks,
-        pm_bids_desc=pm_bids_desc,
-        ks_bids_desc=ks_bids_desc,
+    r = build_pair_orderbook_ladders_result(
+        pm_book, ks_book, pm_side, ks_side, pm_buy_no_via_yes_book_bids
     )
+    return r if isinstance(r, PairOrderbookLadders) else None
 
 
 def proceeds_for_exact_contracts_sell(

@@ -72,6 +72,7 @@ class PaperPosition:
     pm_market_id: str
     kalshi_market_id: str
     pm_token_id: str
+    pm_buy_no_via_yes_book_bids: bool
     n: float
     pm_side: str
     kalshi_side: str
@@ -476,6 +477,7 @@ class PaperEngine:
             pm_market_id=pm_market_id,
             kalshi_market_id=kalshi_market_id,
             pm_token_id=pm_token_id,
+            pm_buy_no_via_yes_book_bids=pm_buy_no_via_yes_book_bids,
             n=opp.contracts,
             pm_side=pm_side,
             kalshi_side=kalshi_side,

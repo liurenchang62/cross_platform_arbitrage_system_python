@@ -125,7 +125,9 @@ Ensure **`config/categories.toml`** exists before the first run (a starter file 
 ### Optional environment variables
 
 - **`POLYMARKET_TAG_SLUG`**: When set, Polymarket market fetches may be restricted to a specific tag slug (see `clients.py`).
-- **`KALSHI_DEMO_API_KEY_ID`** / **`KALSHI_DEMO_PRIVATE_KEY_PATH`**: Required when **`KALSHI_DEMO_MODE_ENABLED`** is `True` in `system_params.py` (RSA private key PEM for Demo API signing).
+- **`KALSHI_DEMO_API_KEY_ID`** / **`KALSHI_DEMO_PRIVATE_KEY_PATH`**: Required when **`KALSHI_DEMO_MODE_ENABLED`** is `True` in `system_params.py` (RSA private key PEM for Demo API signing). The repository default for that flag is `True`; set it to `False` in `system_params.py` to use production Kalshi only.
+- **`ARB_TRACK_DIAG`**: Set to `1` or `true` for verbose per-cycle arbitrage diagnostics at the end of **price-tracking** cycles (`arb_tracking_diagnostics_enabled()`).
+- **`ARB_TRACK_CONCURRENCY`**: Concurrent tracked-pair validations (and full-match verification in parallel when set above **1**); default **12**, clamped to **1–48**. `1` means fully serial.
 - **`PAPER_RUN_LABEL`**: When paper logging is enabled, appended to CSV `notes` / session rows to tag test runs (see `system_params.PAPER_RUN_LABEL_ENV`).
 - **`PAPER_TRADES_CSV`**: Overrides the default path for the paper-trades file when running **`python -m backtest`** (see `system_params.PAPER_TRADES_CSV_ENV`).
 

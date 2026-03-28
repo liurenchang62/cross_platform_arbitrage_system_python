@@ -1,6 +1,7 @@
 # system_params.py
 # 系统级常量：HTTP/分页、匹配与索引、市场窗口、模拟交易（Paper）等。
 import math
+import os
 
 # ==================== 通用参数 ====================
 REQUEST_INTERVAL_MS = 200
@@ -9,14 +10,14 @@ RETRY_INITIAL_DELAY_MS = 1000
 
 # ==================== Polymarket 参数 ====================
 POLYMARKET_PAGE_LIMIT = 200
-POLYMARKET_MAX_MARKETS = 50000
+POLYMARKET_MAX_MARKETS = 30000
 
 # ==================== Kalshi 参数 ====================
 KALSHI_PAGE_LIMIT = 1000
-KALSHI_MAX_MARKETS = 50000
+KALSHI_MAX_MARKETS = 30000
 
 # Kalshi Demo：为 true 时必须配置 KALSHI_DEMO_* 环境变量；为 false 时使用生产 Trade API，并忽略 Demo 环境变量。
-KALSHI_DEMO_MODE_ENABLED = False
+KALSHI_DEMO_MODE_ENABLED = True
 
 KALSHI_DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 
@@ -82,3 +83,17 @@ def paper_settlement_fee_estimate(n: float, fee_pm: float, fee_ks: float) -> flo
     if n <= 0.0 or not math.isfinite(n):
         return 0.0
     return n * (fee_pm + fee_ks)
+
+
+def arb_tracking_diagnostics_enabled() -> bool:
+    v = os.environ.get("ARB_TRACK_DIAG", "").strip().lower()
+    return v in ("1", "true")
+
+
+def arb_track_concurrency() -> int:
+    default = 12
+    try:
+        n = int(os.environ.get("ARB_TRACK_CONCURRENCY", str(default)).strip())
+    except ValueError:
+        n = default
+    return max(1, min(48, n))

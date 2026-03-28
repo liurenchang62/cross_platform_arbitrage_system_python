@@ -125,7 +125,9 @@ python main.py
 ### 环境变量（可选）
 
 - **`POLYMARKET_TAG_SLUG`**：设置后，Polymarket 市场拉取可按指定 tag 过滤（实现见 `clients.py`）。
-- **`KALSHI_DEMO_API_KEY_ID`**、**`KALSHI_DEMO_PRIVATE_KEY_PATH`**：当 `system_params` 中 **`KALSHI_DEMO_MODE_ENABLED=True`** 时必填（Demo API RSA 私钥 PEM）。
+- **`KALSHI_DEMO_API_KEY_ID`**、**`KALSHI_DEMO_PRIVATE_KEY_PATH`**：当 `system_params` 中 **`KALSHI_DEMO_MODE_ENABLED=True`** 时必填（Demo API RSA 私钥 PEM）。仓库内该开关默认为 **`True`**；若在 `system_params.py` 中设为 **`False`**，则始终走 Kalshi 生产 Trade API。
+- **`ARB_TRACK_DIAG`**：设为 **`1`** 或 **`true`** 时，在**价格追踪**周期末输出更详细的套利判定分层统计。
+- **`ARB_TRACK_CONCURRENCY`**：追踪（及全量验证）并发度，默认 **12**，限制在 **1–48**；为 **`1`** 时完全串行。
 - **`PAPER_RUN_LABEL`**：模拟盘写 CSV 时附加到 `notes`（见 `system_params.PAPER_RUN_LABEL_ENV`）。
 - **`PAPER_TRADES_CSV`**：`python -m backtest` 读取的模拟成交 CSV 路径（见 `system_params.PAPER_TRADES_CSV_ENV`）。
 
