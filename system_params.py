@@ -17,7 +17,7 @@ KALSHI_PAGE_LIMIT = 1000
 KALSHI_MAX_MARKETS = 30000
 
 # Kalshi Demo：为 true 时必须配置 KALSHI_DEMO_* 环境变量；为 false 时使用生产 Trade API，并忽略 Demo 环境变量。
-KALSHI_DEMO_MODE_ENABLED = True
+KALSHI_DEMO_MODE_ENABLED = False
 
 KALSHI_DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 
@@ -97,3 +97,8 @@ def arb_track_concurrency() -> int:
     except ValueError:
         n = default
     return max(1, min(48, n))
+
+
+# 每周期一行：套利校验计数与归因（full_match / price_track 均写入）
+ARB_CYCLE_DIAG_CSV_ENABLED = True
+ARB_CYCLE_DIAG_CSV = "logs/arbitrage_cycle_diagnostics.csv"

@@ -1,6 +1,7 @@
 # main.py — Polymarket ↔ Kalshi 跨平台监控与套利验证入口
 from __future__ import annotations
 
+import json
 import asyncio
 import uuid
 from copy import deepcopy
@@ -30,6 +31,8 @@ from arbitrage_detector import (
 from monitor_logger import MonitorLogger
 from tracking import MonitorState, TrackedArbitrage, flip_binary_side, oriented_track_id
 from kalshi_demo import KalshiDemoConfig, KalshiDemoConfigError, place_demo_buy_ioc
+from arb_cycle_diag_log import append_arb_cycle_diagnostic_row
+from log_format import utc_datetime_to_rfc3339
 from system_params import (
     DEMO_REFERENCE_BUDGET_USD,
     FULL_FETCH_INTERVAL,
@@ -79,6 +82,99 @@ class TrackingArbDiag:
     loose_pass_strict_fail: int = 0
     loose_still_fail: int = 0
     accepted: int = 0
+
+    def primary_attribution(self) -> str:
+        """本周期未通过时的主因标签；有通过时区分全过 / 部分过。"""
+        if self.attempts == 0:
+            return "no_attempts"
+        if self.accepted >= self.attempts:
+            return "all_pass"
+        if self.accepted > 0:
+            return "partial_pass"
+        coarse = [
+            ("no_pm_clob_token", self.no_pm_clob_token),
+            ("pm_book_missing", self.pm_book_missing),
+            ("ks_book_missing", self.ks_book_missing),
+            ("ladders_failed", self.ladders_failed),
+            ("rejected_strict", self.rejected_strict),
+        ]
+        coarse.sort(key=lambda x: -x[1])
+        if coarse[0][1] == 0:
+            return "fail_unknown"
+        return f"fail_{coarse[0][0]}"
+
+    def attribution_top_json(self) -> str:
+        """按次数降序取前若干项非零计数，便于定位归因。"""
+        pairs: list[tuple[str, int]] = [
+            ("no_pm_clob_token", self.no_pm_clob_token),
+            ("pm_book_missing", self.pm_book_missing),
+            ("ks_book_missing", self.ks_book_missing),
+            ("ladders_failed", self.ladders_failed),
+            ("ladder_pm_invalid_side", self.ladder_pm_invalid_side),
+            ("ladder_pm_missing_bids", self.ladder_pm_missing_bids),
+            ("ladder_pm_missing_asks", self.ladder_pm_missing_asks),
+            ("ladder_pm_malformed", self.ladder_pm_malformed),
+            ("ladder_pm_liq_empty_side", self.ladder_pm_liq_empty_side),
+            ("ladder_pm_liq_all_filtered", self.ladder_pm_liq_all_filtered),
+            ("ladder_ks_no_body", self.ladder_ks_no_body),
+            ("ladder_ks_invalid_side", self.ladder_ks_invalid_side),
+            ("ladder_ks_malformed", self.ladder_ks_malformed),
+            ("ladder_ks_liq_empty_side", self.ladder_ks_liq_empty_side),
+            ("ladder_ks_liq_all_filtered", self.ladder_ks_liq_all_filtered),
+            ("rejected_strict", self.rejected_strict),
+            ("missing_best_ask", self.missing_best_ask),
+            ("sum_ask_ge_1", self.sum_ask_ge_1),
+            ("sum_ask_lt_1", self.sum_ask_lt_1),
+            ("loose_pass_strict_fail", self.loose_pass_strict_fail),
+            ("loose_still_fail", self.loose_still_fail),
+        ]
+        nonzero = [(k, v) for k, v in pairs if v > 0]
+        nonzero.sort(key=lambda x: -x[1])
+        top = dict(nonzero[:10])
+        top["attempts"] = self.attempts
+        top["accepted"] = self.accepted
+        return json.dumps(top, ensure_ascii=False)
+
+    def as_csv_row(
+        self,
+        time_s: str,
+        cycle_id: int,
+        cycle_phase: str,
+        pool_size: int,
+        arb_conc: int,
+    ) -> list[str]:
+        return [
+            time_s,
+            str(cycle_id),
+            cycle_phase,
+            str(pool_size),
+            str(arb_conc),
+            self.primary_attribution(),
+            self.attribution_top_json(),
+            str(self.attempts),
+            str(self.accepted),
+            str(self.no_pm_clob_token),
+            str(self.pm_book_missing),
+            str(self.ks_book_missing),
+            str(self.ladders_failed),
+            str(self.ladder_pm_invalid_side),
+            str(self.ladder_pm_missing_bids),
+            str(self.ladder_pm_missing_asks),
+            str(self.ladder_pm_malformed),
+            str(self.ladder_pm_liq_empty_side),
+            str(self.ladder_pm_liq_all_filtered),
+            str(self.ladder_ks_no_body),
+            str(self.ladder_ks_invalid_side),
+            str(self.ladder_ks_malformed),
+            str(self.ladder_ks_liq_empty_side),
+            str(self.ladder_ks_liq_all_filtered),
+            str(self.rejected_strict),
+            str(self.missing_best_ask),
+            str(self.sum_ask_ge_1),
+            str(self.sum_ask_lt_1),
+            str(self.loose_pass_strict_fail),
+            str(self.loose_still_fail),
+        ]
 
     def record_ladder_fail(self, r: PairLadderBuildFail) -> None:
         self.ladders_failed += 1
@@ -682,6 +778,26 @@ def format_top10_opportunities(
     return "\n".join(lines)
 
 
+def _write_arb_cycle_diagnostic_csv(
+    diag: TrackingArbDiag,
+    cycle_id: int,
+    cycle_phase: str,
+    pool_size: int,
+) -> None:
+    try:
+        append_arb_cycle_diagnostic_row(
+            diag.as_csv_row(
+                utc_datetime_to_rfc3339(datetime.now(timezone.utc)),
+                cycle_id,
+                cycle_phase,
+                pool_size,
+                arb_track_concurrency(),
+            )
+        )
+    except Exception as e:
+        print(f"   ⚠️ 写入套利周期诊断 CSV 失败: {e}")
+
+
 async def run_full_match_work(
     polymarket: PolymarketClient,
     kalshi: KalshiClient,
@@ -727,6 +843,7 @@ async def run_full_match_work(
     opportunities: List[OpportunityRow] = []
     conc = arb_track_concurrency()
     full_cycle_id = monitor_state.current_cycle
+    diag_total = TrackingArbDiag()
 
     if conc <= 1:
         for pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion in matches:
@@ -757,7 +874,7 @@ async def run_full_match_work(
                 demo_http,
                 kalshi_demo_cfg,
                 demo_trading_active,
-                None,
+                diag_total,
             )
             if validated:
                 verified, pm_exp, ks_exp = validated
@@ -772,7 +889,12 @@ async def run_full_match_work(
         )
         sem = asyncio.Semaphore(conc)
 
-        async def _full_one(row: _MATCH_ROW_T) -> Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime], str, _MATCH_ROW_T]]:
+        async def _full_one(
+            row: _MATCH_ROW_T,
+        ) -> Tuple[
+            Optional[Tuple[ArbitrageOpportunity, Optional[datetime], Optional[datetime], str, _MATCH_ROW_T]],
+            TrackingArbDiag,
+        ]:
             pm_market, kalshi_market, similarity, pm_side, kalshi_side, needs_inversion = row
             pair_label = oriented_track_id(
                 pm_market.market_id,
@@ -780,6 +902,7 @@ async def run_full_match_work(
                 pm_side,
                 kalshi_side,
             )
+            frag = TrackingArbDiag()
             async with sem:
                 core = await validate_arbitrage_core(
                     polymarket,
@@ -792,15 +915,16 @@ async def run_full_match_work(
                     needs_inversion,
                     trade_amount,
                     pair_cap_usdt,
-                    None,
+                    frag,
                 )
             if core is None:
-                return None
+                return (None, frag)
             opp, pm_exp, ks_exp = core
-            return (opp, pm_exp, ks_exp, pair_label, row)
+            return ((opp, pm_exp, ks_exp, pair_label, row), frag)
 
         chunk = await asyncio.gather(*[_full_one(row) for row in matches])
-        for item in chunk:
+        for item, frag in chunk:
+            diag_total.merge_from(frag)
             if item is None:
                 continue
             opp, pm_exp, ks_exp, pair_label, row = item
@@ -831,6 +955,11 @@ async def run_full_match_work(
             opportunities.append(
                 (opp, pm_market.title, kalshi_market.title, pm_exp, ks_exp)
             )
+
+    _write_arb_cycle_diagnostic_csv(
+        diag_total, full_cycle_id, "full_match", len(matches)
+    )
+    diag_total.print_compact()
 
     top10_block = format_top10_opportunities(opportunities, top10_mode_caption)
     print(top10_block, end="")
@@ -1051,6 +1180,10 @@ async def run_tracking_cycle(
         diag_total.print_summary()
     else:
         diag_total.print_compact()
+
+    _write_arb_cycle_diagnostic_csv(
+        diag_total, monitor_state.current_cycle, "price_track", n_active
+    )
 
     top10_block = format_top10_opportunities(opportunities, top10_mode_caption)
     print(top10_block, end="")
